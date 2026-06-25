@@ -46,6 +46,70 @@ class ExtractSpeakableTextTests(unittest.TestCase):
             ),
         )
 
+    def test_question_trusts_rendered_cloze_before_raw_ord(self):
+        html = (
+            "There is an increased risk for "
+            '<span class="cloze">[...]</span> papillary muscle rupture '
+            "(post-MI) due to its single blood supply from the "
+            "{{c2::posterior descending}} artery"
+        )
+
+        result = extract_speakable_text(html, active_ord=1)
+
+        self.assertEqual(
+            result,
+            (
+                "There is an increased risk for bla bla bla papillary "
+                "muscle rupture (post-MI) due to its single blood supply "
+                "from the posterior descending artery"
+            ),
+        )
+
+    def test_question_masks_rendered_cloze_span_with_answer_text(self):
+        html = (
+            "Fructose-1,6-bisphosphate is converted into "
+            '<span class="cloze">glyceraldehyde-3-phosphate</span> '
+            "and dihydroxyacetone-phosphate via the enzyme aldolase"
+        )
+
+        result = extract_speakable_text(html, active_ord=0)
+
+        self.assertEqual(
+            result,
+            (
+                "Fructose-1,6-bisphosphate is converted into bla bla bla "
+                "and dihydroxyacetone-phosphate via the enzyme aldolase"
+            ),
+        )
+
+    def test_rendered_inactive_cloze_text_remains_speakable(self):
+        html = (
+            "Ruxolitinib treats "
+            '<span class="cloze-inactive">myelofibrosis</span> and '
+            '<span class="cloze">[...]</span>'
+        )
+
+        result = extract_speakable_text(html, active_ord=1)
+
+        self.assertEqual(
+            result,
+            "Ruxolitinib treats myelofibrosis and bla bla bla",
+        )
+
+    def test_rendered_nested_inactive_cloze_preserves_visible_text(self):
+        html = (
+            "Ruxolitinib treats "
+            '<span class="cloze-inactive">myelofibrosis '
+            '<span class="cloze">[...]</span></span>'
+        )
+
+        result = extract_speakable_text(html, active_ord=1)
+
+        self.assertEqual(
+            result,
+            "Ruxolitinib treats myelofibrosis bla bla bla",
+        )
+
     def test_question_without_active_ord_masks_all_raw_clozes(self):
         result = extract_speakable_text(EXAMPLE_RAW_CLOZE, active_ord=None)
 

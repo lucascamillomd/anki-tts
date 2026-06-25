@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Build the Anki TTS add-on package (.ankiaddon)
-# Includes bundled Piper TTS, onnxruntime, numpy, and Alan voice model.
 # Output: anki_tts.ankiaddon (installable via Anki -> Tools -> Add-ons -> Install from file)
 set -euo pipefail
 
@@ -21,11 +20,24 @@ cd "$ADDON_DIR"
 zip -r "../$OUTPUT" . \
     -x "*.pyc" \
     -x "*/__pycache__/*" \
-    -x "user_files/*" \
+    -x "user_files/audio_cache" \
+    -x "user_files/audio_cache/*" \
+    -x "user_files/*.mp3" \
+    -x "user_files/*.json" \
+    -x "user_files/*.tmp" \
     -x "CLAUDE.md" \
+    -x "*/CLAUDE.md" \
     -x ".DS_Store" \
     -x "meta.json" \
-    -x "voices/*.onnx"
+    -x "model_downloader.py" \
+    -x "voices/" \
+    -x "voices/*" \
+    -x "vendor/piper/" \
+    -x "vendor/piper/*" \
+    -x "vendor/onnxruntime/" \
+    -x "vendor/onnxruntime/*" \
+    -x "vendor/numpy/" \
+    -x "vendor/numpy/*"
 cd ..
 
 SIZE=$(du -h "$OUTPUT" | cut -f1)

@@ -58,9 +58,16 @@ logs/
 # Build artifacts
 *.ankiaddon
 
+# Runtime add-on user data
+anki_tts_addon/user_files/*
+!anki_tts_addon/user_files/README.txt
+
 # Audio test files
 *.wav
 *.mp3
+
+# Local browser automation scratch files
+.playwright-mcp/
 
 # Bundled add-on dependencies (too large for git, must be built locally)
 anki_tts_addon/vendor/

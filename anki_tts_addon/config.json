@@ -1,7 +1,10 @@
 {
-    "enabled": true,
-    "speed": 1.5,
-    "speak_question": true,
-    "speak_answer": false,
-    "fallback_to_system": true
+  "enabled": true,
+  "speak_question": true,
+  "speak_answer": false,
+  "fallback_to_system": true,
+  "speed": 1.5,
+  "cache_enabled": true,
+  "prefetch_enabled": true,
+  "cache_max_mb": 2048
 }
