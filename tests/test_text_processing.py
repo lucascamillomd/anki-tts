@@ -151,6 +151,40 @@ class ExtractSpeakableTextTests(unittest.TestCase):
 
         self.assertEqual(result, "Start bla bla bla End")
 
+    def test_inactive_cloze_sharing_cloze_class_stays_visible(self):
+        # Pre-2.1.56 Anki (and some note types) wrap inactive clozes in
+        # class="cloze" too; only the active cloze is shown as [...]. The
+        # visible inactive text must not be masked.
+        html = (
+            '<span class="cloze">Giant cell</span> arteritis is a '
+            "granulomatous vasculitis that classically involves branches "
+            'of the <span class="cloze">[...]</span> carotid artery'
+        )
+
+        result = extract_speakable_text(html, active_ord=0)
+
+        self.assertEqual(
+            result,
+            (
+                "Giant cell arteritis is a granulomatous vasculitis that "
+                "classically involves branches of the bla bla bla carotid "
+                "artery"
+            ),
+        )
+
+    def test_inactive_cloze_with_combined_class_stays_visible(self):
+        html = (
+            '<span class="cloze cloze-inactive">Giant cell</span> arteritis '
+            'involves the <span class="cloze">[...]</span> carotid artery'
+        )
+
+        result = extract_speakable_text(html, active_ord=0)
+
+        self.assertEqual(
+            result,
+            "Giant cell arteritis involves the bla bla bla carotid artery",
+        )
+
     def test_answer_side_unwraps_raw_clozes_after_separator(self):
         html = (
             f"<div>front {EXAMPLE_RAW_CLOZE}</div>"

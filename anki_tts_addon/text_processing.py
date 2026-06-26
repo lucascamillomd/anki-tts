@@ -113,23 +113,29 @@ def _is_rendered_active_cloze_tag(attrs: str) -> bool:
     if not class_match:
         return False
     classes = set(class_match.group(2).split())
-    return "cloze" in classes
+    # Anki marks the active (hidden) cloze with class "cloze" and inactive
+    # (visible) clozes with "cloze-inactive". Some note types/add-ons apply
+    # BOTH tokens to inactive clozes, so an element is only treated as active
+    # when it carries "cloze" and not "cloze-inactive".
+    return "cloze" in classes and "cloze-inactive" not in classes
 
 
-def _replace_rendered_active_clozes(content: str):
-    """Mask the whole body of active ``class="cloze"`` elements.
+def _find_active_cloze_spans(content: str, mask: bool):
+    """Detect, and optionally mask, active ``class="cloze"`` elements.
 
-    Returns ``(masked_content, found_active_cloze)`` in a single pass so the
-    caller can both mask the rendered cloze and learn whether a genuine
-    rendered cloze exists (used to choose how raw ``{{cN::}}`` markers are
-    handled) without scanning the HTML twice.
+    Returns ``(content, found_active_cloze)`` in a single pass. When ``mask``
+    is False the content is returned unchanged and only detection happens;
+    when True, each active cloze element's whole body is replaced with the
+    spoken placeholder. The nesting depth of the cloze element's own tag name
+    is tracked so a cloze wrapped in another element, or containing nested
+    same-name children, is masked in full instead of leaking part of the
+    answer.
 
-    Detection is anchored to genuine ``class="cloze"`` elements (which is how
-    Anki marks the active hidden cloze, whether its body is ``[...]`` or styled
-    answer text); a bare literal ``[...]`` in ordinary content does NOT count.
-    The nesting depth of the cloze element's own tag name is tracked so a cloze
-    span wrapped in another element, or containing nested same-name children,
-    is masked in full instead of leaking part of the answer.
+    Callers pass ``mask=False`` when a rendered ``[...]`` placeholder is
+    present: in that case the active cloze is already masked by the placeholder
+    substitution and the remaining ``class="cloze"`` spans are inactive,
+    visible text that must be preserved (older Anki and some note types wrap
+    inactive clozes in ``class="cloze"`` too).
     """
     out = []
     last = 0
@@ -149,10 +155,13 @@ def _replace_rendered_active_clozes(content: str):
             out.append(between)
             if not is_close and _is_rendered_active_cloze_tag(attrs):
                 found = True
-                out.append(SPOKEN_CLOZE_PLACEHOLDER)
-                if not self_close:
-                    active_tag = tag
-                    active_depth = 1
+                if mask:
+                    out.append(SPOKEN_CLOZE_PLACEHOLDER)
+                    if not self_close:
+                        active_tag = tag
+                        active_depth = 1
+                else:
+                    out.append(match.group(0))
             else:
                 out.append(match.group(0))
         elif not self_close and tag == active_tag:
@@ -212,6 +221,12 @@ def extract_speakable_text(
     if not img_only and re.search(r"<img[^>]*>", content):
         return ""
 
+    # A rendered "[...]" means Anki has already hidden the active cloze; the
+    # remaining class="cloze" spans are then inactive, visible text.
+    had_rendered_placeholder = bool(
+        RENDERED_CLOZE_PLACEHOLDER_PATTERN.search(content)
+    )
+
     # Replace [...] cloze placeholders with spoken form
     content = RENDERED_CLOZE_PLACEHOLDER_PATTERN.sub(
         SPOKEN_CLOZE_PLACEHOLDER, content
@@ -221,9 +236,13 @@ def extract_speakable_text(
         # On answer side, preserve answers and only unwrap raw cloze syntax.
         content = RAW_CLOZE_UNWRAP_PATTERN.sub(r"\1", content)
     else:
-        # Single pass: mask active rendered cloze spans and learn whether any
-        # genuine rendered cloze exists.
-        content, has_rendered_cloze = _replace_rendered_active_clozes(content)
+        # Single pass over class="cloze" spans. When the active cloze was shown
+        # as [...] (already masked above) we only DETECT spans and leave their
+        # visible inactive text intact; otherwise (templates that hide the
+        # active cloze via CSS while keeping its text) we mask the span itself.
+        content, has_rendered_cloze = _find_active_cloze_spans(
+            content, mask=not had_rendered_placeholder
+        )
         if has_rendered_cloze:
             # Rendered cloze markers reflect what Anki is actually hiding; any
             # remaining raw markers in the same HTML are visible text.
