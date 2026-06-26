@@ -136,6 +136,55 @@ class AudioCacheStateTests(unittest.TestCase):
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["entries"], {})
 
+    def test_corrupt_attempts_field_does_not_crash_mark_failed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "entries": {
+                            "abc": {
+                                "key": "abc",
+                                "status": "failed",
+                                "attempts": "not-a-number",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = AudioCacheState(path, now=Clock(100))
+
+            state.mark_failed("abc", "boom")
+
+            entry = state.entry("abc")
+            self.assertEqual(entry["attempts"], 1)
+            self.assertEqual(entry["next_retry_at"], 130)
+
+    def test_corrupt_next_retry_at_does_not_crash_can_retry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "entries": {
+                            "abc": {
+                                "key": "abc",
+                                "status": "failed",
+                                "attempts": 1,
+                                "next_retry_at": "whenever",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = AudioCacheState(path, now=Clock(100))
+
+            self.assertTrue(state.can_retry("abc"))
+
     def test_each_save_uses_unique_temp_file_to_avoid_replace_races(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"

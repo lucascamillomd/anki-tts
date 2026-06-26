@@ -30,7 +30,11 @@ from pathlib import Path
 from .audio_cache import AudioCache, speech_cache_key
 from .audio_cache_state import AudioCacheState
 from .audio_prefetch import AudioPrefetcher
-from .card_text import speakable_answer_text, speakable_question_text
+from .card_text import (
+    rendered_question_html,
+    speakable_answer_text,
+    speakable_question_text,
+)
 from .tts_engine import TTSEngine, set_status_callback
 from .review_html_cache import (
     REVIEW_ANSWER_CONTEXT,
@@ -200,19 +204,24 @@ def engine() -> TTSEngine:
         and _engine_cache_enabled != cache_enabled
     ):
         _engine.stop()
-        if not _stop_prefetcher(timeout=PREFETCH_STOP_TIMEOUT_SECONDS):
-            return _engine
-        if (
-            hasattr(_engine, "wait_for_speech")
-            and not _engine.wait_for_speech(
+        drained = _stop_prefetcher(timeout=PREFETCH_STOP_TIMEOUT_SECONDS)
+        if drained and hasattr(_engine, "wait_for_speech"):
+            drained = _engine.wait_for_speech(
                 timeout=PREFETCH_STOP_TIMEOUT_SECONDS
             )
-        ):
-            return _engine
-        _engine = TTSEngine(
-            audio_cache=_configured_audio_cache(conf),
-            cache_max_bytes=_cache_max_bytes(conf),
-        )
+        if drained:
+            _engine = TTSEngine(
+                audio_cache=_configured_audio_cache(conf),
+                cache_max_bytes=_cache_max_bytes(conf),
+            )
+        else:
+            # Could not fully drain in-flight work for a clean rebuild;
+            # reconfigure the existing engine in place so it immediately
+            # honors the new cache setting instead of keeping stale wiring.
+            if hasattr(_engine, "set_audio_cache"):
+                _engine.set_audio_cache(_configured_audio_cache(conf))
+            if hasattr(_engine, "set_cache_max_bytes"):
+                _engine.set_cache_max_bytes(_cache_max_bytes(conf))
         _engine_cache_enabled = cache_enabled
     elif hasattr(_engine, "set_cache_max_bytes"):
         _engine.set_cache_max_bytes(_cache_max_bytes(conf))
@@ -438,6 +447,20 @@ def _cache_key_for_text(text: str, conf: dict) -> str:
     )
 
 
+def _warm_question_text(card) -> str:
+    """Question text for warm-up/status, keyed to match live playback.
+
+    The live reviewer hooks read the exact ``card_will_show`` HTML for a card
+    when it is shown. When that HTML is available for this card, warm-up keys
+    its audio off the same source so the warmed clip is found on playback
+    instead of being stored under a divergent key; otherwise it falls back to
+    ``render_output`` (the closest predictor of the live text).
+    """
+    rendered = rendered_question_html(card)
+    html = get_review_html(card, REVIEW_QUESTION_CONTEXT, rendered)
+    return speakable_question_text(card, html)
+
+
 def _on_audio_prefetch_result(text, config, ok, error_message) -> None:
     if ok is None:
         return
@@ -450,30 +473,8 @@ def _on_audio_prefetch_result(text, config, ok, error_message) -> None:
         )
 
 
-def _audio_cache_counts() -> tuple:
-    conf = get_config()
-    cache = audio_cache()
-    state = audio_cache_state()
-    total = 0
-    cached = 0
-    pending = 0
-    failed = 0
-
-    for card_id in mw.col.find_cards(ALL_CARDS_SEARCH):
-        card = mw.col.get_card(card_id)
-        card_cached, card_total, card_pending, card_failed = (
-            _audio_cache_counts_for_card(card, conf, cache, state)
-        )
-        cached += card_cached
-        total += card_total
-        pending += card_pending
-        failed += card_failed
-
-    return cached, total, pending, failed
-
-
 def _audio_cache_counts_for_card(card, conf, cache, state) -> tuple:
-    text = speakable_question_text(card)
+    text = _warm_question_text(card)
     if not text:
         return 0, 0, 0, 0
 
@@ -497,17 +498,6 @@ def _worker_status_label() -> str:
     if status.get("active", 0) > 0 or status.get("pending", 0) > 0:
         return "running"
     return "idle"
-
-
-def _audio_cache_status_message() -> str:
-    conf = get_config()
-    if not _cache_enabled(conf):
-        return "TTS audio caching is disabled"
-    if mw.col is None:
-        return "No Anki collection is open"
-
-    cached, total, pending, failed = _audio_cache_counts()
-    return _format_audio_cache_status_message(cached, total, pending, failed)
 
 
 def _format_audio_cache_status_message(cached, total, pending, failed) -> str:
@@ -613,7 +603,7 @@ def _show_audio_cache_status_batched(
 
 
 def _queue_audio_cache_card(card, conf, worker, cache, state) -> bool:
-    text = speakable_question_text(card)
+    text = _warm_question_text(card)
     if not text:
         return False
 
@@ -627,47 +617,6 @@ def _queue_audio_cache_card(card, conf, worker, cache, state) -> bool:
         state.mark_pending(key, text)
         return True
     return False
-
-
-def _queue_audio_cache(
-    search_query: str, show_tooltip: bool, notify_on_idle: bool = False
-) -> int:
-    """Queue question audio generation without card access off-thread."""
-    conf = get_config()
-    if not _prefetch_enabled(conf):
-        if show_tooltip:
-            tooltip("TTS audio caching is disabled")
-        return 0
-
-    if mw.col is None:
-        return 0
-
-    worker = prefetcher()
-    if worker.start() is False:
-        if show_tooltip:
-            tooltip(
-                "Skipped queuing TTS audio because audio generation is still stopping"
-            )
-        return 0
-
-    cache = audio_cache()
-    state = audio_cache_state()
-    if notify_on_idle:
-        _begin_cache_status_notification()
-
-    queued = 0
-    try:
-        for card_id in mw.col.find_cards(search_query):
-            card = mw.col.get_card(card_id)
-            if _queue_audio_cache_card(card, conf, worker, cache, state):
-                queued += 1
-    finally:
-        if show_tooltip:
-            tooltip(f"Queued {queued} cards for TTS audio caching")
-        if notify_on_idle:
-            _finish_cache_status_queueing(queued)
-
-    return queued
 
 
 def _queue_audio_cache_batched(
@@ -857,11 +806,6 @@ def _auto_warm_all_audio_cache(profile_generation=None, collection=None):
 def on_sync_did_finish():
     """Refresh missing cached audio after collection sync completes."""
     _schedule_auto_warm_all_audio_cache(AUTO_WARM_SYNC_DELAY_MS)
-
-
-def warm_due_audio_cache():
-    """Backward-compatible alias for older callers."""
-    warm_all_audio_cache()
 
 
 def clear_audio_cache():

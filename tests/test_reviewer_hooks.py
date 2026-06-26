@@ -43,6 +43,10 @@ class _FakeEngine:
         self.spoken = []
         self.wait_result = wait_result
         self.wait_timeouts = []
+        self.set_audio_cache_calls = []
+
+    def set_audio_cache(self, cache):
+        self.set_audio_cache_calls.append(cache)
 
     def stop(self):
         self.stop_count += 1
@@ -601,7 +605,7 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertIsNot(cache_reenabled_engine, cache_disabled_engine)
         self.assertIsNotNone(cache_reenabled_engine._audio_cache)
 
-    def test_engine_keeps_existing_engine_when_prefetcher_stop_times_out(self):
+    def test_engine_reconfigures_in_place_when_prefetcher_stop_times_out(self):
         engine = _FakeEngine()
         prefetcher = _FakePrefetcher(stop_result=False)
         self.addon._engine = engine
@@ -613,7 +617,10 @@ class ReviewerHookTests(unittest.TestCase):
 
         self.assertIs(result, engine)
         self.assertIs(self.addon._engine, engine)
-        self.assertTrue(self.addon._engine_cache_enabled)
+        # The cache-enabled flag must be reconciled to the new setting, not
+        # left stale while the engine keeps caching the user disabled.
+        self.assertFalse(self.addon._engine_cache_enabled)
+        self.assertEqual(engine.set_audio_cache_calls, [None])
         self.assertEqual(
             prefetcher.stop_timeouts,
             [self.addon.PREFETCH_STOP_TIMEOUT_SECONDS],
@@ -646,7 +653,7 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(events[:2], ["engine.stop", "prefetcher.stop"])
         self.assertEqual(engine.stop_count, 1)
 
-    def test_engine_keeps_existing_engine_when_live_speech_stop_times_out(self):
+    def test_engine_reconfigures_in_place_when_live_speech_stop_times_out(self):
         engine = _FakeEngine(wait_result=False)
         self.addon._engine = engine
         self.addon._engine_cache_enabled = True
@@ -657,12 +664,33 @@ class ReviewerHookTests(unittest.TestCase):
 
         self.assertIs(result, engine)
         self.assertIs(self.addon._engine, engine)
-        self.assertTrue(self.addon._engine_cache_enabled)
+        self.assertFalse(self.addon._engine_cache_enabled)
+        self.assertEqual(engine.set_audio_cache_calls, [None])
         self.assertEqual(engine.stop_count, 1)
         self.assertEqual(
             engine.wait_timeouts,
             [self.addon.PREFETCH_STOP_TIMEOUT_SECONDS],
         )
+
+    def test_warm_question_text_prefers_captured_reviewer_html(self):
+        # When a card has already been shown this session, warm-up must key its
+        # audio off the same reviewer HTML the live path uses, so the warmed
+        # clip is actually found on playback instead of under a divergent key.
+        card = _FakeDueCard(7, rendered_question="render output text")
+        self.addon.cache_review_html(
+            "captured reviewer text", card, self.addon.REVIEW_QUESTION_CONTEXT
+        )
+
+        text = self.addon._warm_question_text(card)
+
+        self.assertEqual(text, "captured reviewer text")
+
+    def test_warm_question_text_falls_back_to_render_output(self):
+        card = _FakeDueCard(8, rendered_question="render output text")
+
+        text = self.addon._warm_question_text(card)
+
+        self.assertEqual(text, "render output text")
 
     def test_question_tts_uses_cached_rendered_question_html(self):
         card = _FakeCard()

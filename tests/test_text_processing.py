@@ -121,6 +121,36 @@ class ExtractSpeakableTextTests(unittest.TestCase):
             ),
         )
 
+    def test_literal_bracket_ellipsis_does_not_reveal_active_raw_cloze(self):
+        # A bare "[...]" in ordinary content must not flip the masking
+        # strategy and unwrap the active raw cloze answer.
+        html = "Define the gap: [...] and the value is {{c1::42}}"
+
+        result = extract_speakable_text(html, active_ord=0)
+
+        self.assertEqual(
+            result,
+            "Define the gap: bla bla bla and the value is bla bla bla",
+        )
+
+    def test_question_masks_active_cloze_span_wrapped_in_other_element(self):
+        html = '<div class="front"><span class="cloze">SecretAnswer</span></div>'
+
+        result = extract_speakable_text(html, active_ord=0)
+
+        self.assertEqual(result, "bla bla bla")
+
+    def test_question_masks_active_cloze_span_with_nested_same_tag(self):
+        html = (
+            "Start "
+            '<span class="cloze">Secret<span>Nested</span>Answer</span>'
+            " End"
+        )
+
+        result = extract_speakable_text(html, active_ord=0)
+
+        self.assertEqual(result, "Start bla bla bla End")
+
     def test_answer_side_unwraps_raw_clozes_after_separator(self):
         html = (
             f"<div>front {EXAMPLE_RAW_CLOZE}</div>"

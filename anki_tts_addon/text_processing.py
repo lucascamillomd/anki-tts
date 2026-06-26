@@ -50,9 +50,8 @@ RAW_CLOZE_UNWRAP_PATTERN = re.compile(
 RAW_CLOZE_CAPTURE_PATTERN = re.compile(
     r"\{\{c(\d+)::(.*?)(?:::.*?)?\}\}", re.DOTALL | re.IGNORECASE
 )
-RENDERED_CLOZE_PATTERN = re.compile(
-    r"<([a-zA-Z0-9]+)([^>]*)>.*?</\1>",
-    re.DOTALL | re.IGNORECASE,
+_TAG_TOKEN_PATTERN = re.compile(
+    r"<(/?)([a-zA-Z0-9]+)([^>]*?)(/?)>", re.DOTALL
 )
 CLASS_ATTR_PATTERN = re.compile(
     r"\bclass\s*=\s*([\"'])(.*?)\1", re.DOTALL | re.IGNORECASE
@@ -109,14 +108,6 @@ def _mask_active_raw_cloze(content: str, active_ord: int) -> str:
     return RAW_CLOZE_CAPTURE_PATTERN.sub(_replace, content)
 
 
-def _has_rendered_cloze(content: str) -> bool:
-    """Return True when the HTML already contains Anki's rendered hidden cloze."""
-    return bool(
-        RENDERED_CLOZE_PLACEHOLDER_PATTERN.search(content)
-        or _has_rendered_active_cloze_span(content)
-    )
-
-
 def _is_rendered_active_cloze_tag(attrs: str) -> bool:
     class_match = CLASS_ATTR_PATTERN.search(attrs)
     if not class_match:
@@ -125,20 +116,57 @@ def _is_rendered_active_cloze_tag(attrs: str) -> bool:
     return "cloze" in classes
 
 
-def _has_rendered_active_cloze_span(content: str) -> bool:
-    return any(
-        _is_rendered_active_cloze_tag(match.group(2))
-        for match in RENDERED_CLOZE_PATTERN.finditer(content)
-    )
+def _replace_rendered_active_clozes(content: str):
+    """Mask the whole body of active ``class="cloze"`` elements.
 
+    Returns ``(masked_content, found_active_cloze)`` in a single pass so the
+    caller can both mask the rendered cloze and learn whether a genuine
+    rendered cloze exists (used to choose how raw ``{{cN::}}`` markers are
+    handled) without scanning the HTML twice.
 
-def _replace_rendered_active_clozes(content: str) -> str:
-    def _replace(match: re.Match) -> str:
-        if _is_rendered_active_cloze_tag(match.group(2)):
-            return SPOKEN_CLOZE_PLACEHOLDER
-        return match.group(0)
+    Detection is anchored to genuine ``class="cloze"`` elements (which is how
+    Anki marks the active hidden cloze, whether its body is ``[...]`` or styled
+    answer text); a bare literal ``[...]`` in ordinary content does NOT count.
+    The nesting depth of the cloze element's own tag name is tracked so a cloze
+    span wrapped in another element, or containing nested same-name children,
+    is masked in full instead of leaking part of the answer.
+    """
+    out = []
+    last = 0
+    active_tag = None
+    active_depth = 0
+    found = False
 
-    return RENDERED_CLOZE_PATTERN.sub(_replace, content)
+    for match in _TAG_TOKEN_PATTERN.finditer(content):
+        between = content[last:match.start()]
+        last = match.end()
+        is_close = match.group(1) == "/"
+        tag = match.group(2).lower()
+        attrs = match.group(3)
+        self_close = match.group(4) == "/"
+
+        if active_tag is None:
+            out.append(between)
+            if not is_close and _is_rendered_active_cloze_tag(attrs):
+                found = True
+                out.append(SPOKEN_CLOZE_PLACEHOLDER)
+                if not self_close:
+                    active_tag = tag
+                    active_depth = 1
+            else:
+                out.append(match.group(0))
+        elif not self_close and tag == active_tag:
+            # Inside an active cloze: drop content, balance same-name tags.
+            if is_close:
+                active_depth -= 1
+                if active_depth == 0:
+                    active_tag = None
+            else:
+                active_depth += 1
+
+    if active_tag is None:
+        out.append(content[last:])
+    return "".join(out), found
 
 
 def extract_speakable_text(
@@ -184,8 +212,6 @@ def extract_speakable_text(
     if not img_only and re.search(r"<img[^>]*>", content):
         return ""
 
-    has_rendered_cloze = _has_rendered_cloze(content)
-
     # Replace [...] cloze placeholders with spoken form
     content = RENDERED_CLOZE_PLACEHOLDER_PATTERN.sub(
         SPOKEN_CLOZE_PLACEHOLDER, content
@@ -194,16 +220,17 @@ def extract_speakable_text(
     if strip_question:
         # On answer side, preserve answers and only unwrap raw cloze syntax.
         content = RAW_CLOZE_UNWRAP_PATTERN.sub(r"\1", content)
-    elif has_rendered_cloze:
-        # Rendered cloze markers reflect what Anki is actually hiding.
-        # Any remaining raw markers in the same HTML are visible text.
-        content = _replace_rendered_active_clozes(content)
-        content = RAW_CLOZE_UNWRAP_PATTERN.sub(r"\1", content)
     else:
-        # Question side should mask only the active raw cloze, not all clozes.
-        content = _mask_active_raw_cloze(content, active_ord)
-        # Some templates render active clozes with class="cloze" instead of [...].
-        content = _replace_rendered_active_clozes(content)
+        # Single pass: mask active rendered cloze spans and learn whether any
+        # genuine rendered cloze exists.
+        content, has_rendered_cloze = _replace_rendered_active_clozes(content)
+        if has_rendered_cloze:
+            # Rendered cloze markers reflect what Anki is actually hiding; any
+            # remaining raw markers in the same HTML are visible text.
+            content = RAW_CLOZE_UNWRAP_PATTERN.sub(r"\1", content)
+        else:
+            # No rendered cloze: mask only the active raw cloze by ordinal.
+            content = _mask_active_raw_cloze(content, active_ord)
 
     # Strip MathJax/LaTeX before HTML removal (delimiters may span tags)
     content = _strip_math(content)

@@ -10,6 +10,14 @@ CACHE_FORMAT_VERSION = "edge-mp3-v1"
 MIN_AUDIO_BYTES = 1024
 
 
+class AudioTooSmallError(ValueError):
+    """Raised when generated audio is too small to be a usable clip.
+
+    This is a soft, content-level failure (a truncated/near-empty clip), not a
+    sign that the TTS backend itself is unavailable.
+    """
+
+
 def speech_cache_key(text, voice, speed, version=CACHE_FORMAT_VERSION):
     payload = {
         "text": text,
@@ -72,7 +80,9 @@ class AudioCache:
 
         if size < MIN_AUDIO_BYTES:
             self._remove_path(tmp_path)
-            raise ValueError(f"Audio temp file is too small: {size} bytes")
+            raise AudioTooSmallError(
+                f"Audio temp file is too small: {size} bytes"
+            )
 
         final_path = self.path_for_key(key)
         os.replace(tmp_path, final_path)

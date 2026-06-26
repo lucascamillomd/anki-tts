@@ -10,6 +10,22 @@ RETRY_DELAYS_SECONDS = (30, 120, 600)
 STATE_VERSION = 1
 
 
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_optional_int(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class AudioCacheState:
     def __init__(self, path, now=None):
         self.path = Path(path)
@@ -110,10 +126,18 @@ class AudioCacheState:
         if not isinstance(entries, dict):
             return {}
         return {
-            str(key): entry
+            str(key): self._normalize_entry(entry)
             for key, entry in entries.items()
             if isinstance(entry, dict)
         }
+
+    @staticmethod
+    def _normalize_entry(entry):
+        """Coerce numeric fields so a corrupt/foreign file can't crash later."""
+        normalized = dict(entry)
+        normalized["attempts"] = _as_int(entry.get("attempts"), 0)
+        normalized["next_retry_at"] = _as_optional_int(entry.get("next_retry_at"))
+        return normalized
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

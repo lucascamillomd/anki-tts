@@ -6,6 +6,7 @@ Edge TTS is bundled in vendor/ and imported directly.
 
 import os
 import sys
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -14,7 +15,7 @@ import platform
 from pathlib import Path
 from typing import Optional, Callable
 
-from .audio_cache import AudioCache, speech_cache_key
+from .audio_cache import AudioCache, AudioTooSmallError, speech_cache_key
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +111,11 @@ class TTSEngine:
 
     EDGE_VOICE = "en-GB-RyanNeural"
 
+    # Run the (directory-scanning) cache cleanup only once per this many
+    # prefetch generations, instead of after every card, to avoid O(N^2)
+    # work while warming a large collection.
+    PREFETCH_CLEANUP_INTERVAL = 50
+
     def __init__(
         self,
         audio_cache: Optional[AudioCache] = None,
@@ -128,9 +134,14 @@ class TTSEngine:
         self._edge_tts = None
         self._edge_tts_checked = False
         self._edge_tts_failed = False  # True after first speech failure
+        self._prefetch_since_cleanup = 0
 
     def set_cache_max_bytes(self, cache_max_bytes: Optional[int]) -> None:
         self._cache_max_bytes = cache_max_bytes
+
+    def set_audio_cache(self, audio_cache: Optional[AudioCache]) -> None:
+        """Swap the cache wiring in place (used when a clean rebuild can't run)."""
+        self._audio_cache = audio_cache
 
     def _get_edge_tts(self):
         """Lazily load bundled edge_tts on first call."""
@@ -262,24 +273,37 @@ class TTSEngine:
         if not text or self._audio_cache is None:
             return False
 
+        # Don't keep hammering Edge for every warm-up card once it is known
+        # to be unavailable; the live path shares the same failure latch.
+        if self._edge_tts_failed:
+            return False
+
         speed = config.get("speed", 1.5)
         if self._cached_path(text, speed) is not None:
             return True
 
-        generation_id = self._begin_generation()
         edge_tts = self._get_edge_tts()
         if edge_tts is None:
             return False
 
         try:
-            self._generate_edge_cached(text, speed, edge_tts, generation_id)
+            # Prefetch is intentionally decoupled from the live playback
+            # generation: a card advance during review (speak()->stop()) must
+            # not cancel or delete in-flight warm-up work.
+            self._generate_edge_cached(
+                text, speed, edge_tts, generation_id=None
+            )
         except _SpeechCancelled:
             return None
+        except AudioTooSmallError as e:
+            log.warning("Edge TTS prefetch produced unusable audio: %s", e)
+            return False
         except Exception as e:
             log.warning("Edge TTS prefetch failed: %s", e)
+            self._edge_tts_failed = True
             return False
         else:
-            self._cleanup_cache()
+            self._maybe_cleanup_cache()
             return True
 
     def _speak(
@@ -321,6 +345,15 @@ class TTSEngine:
                     return
                 except _SpeechCancelled:
                     raise
+                except AudioTooSmallError as e:
+                    # Content-level glitch, not Edge being down: fall back for
+                    # this card but keep using Edge for the rest of the session.
+                    self._raise_if_cancelled(generation_id)
+                    log.warning(
+                        "Edge TTS produced unusable audio, using system "
+                        "voice for this card: %s",
+                        e,
+                    )
                 except Exception as e:
                     self._raise_if_cancelled(generation_id)
                     log.warning(
@@ -343,6 +376,13 @@ class TTSEngine:
             self._audio_cache.cleanup(self._cache_max_bytes)
         except Exception as e:
             log.warning("Audio cache cleanup failed: %s", e)
+
+    def _maybe_cleanup_cache(self) -> None:
+        """Clean the cache only every PREFETCH_CLEANUP_INTERVAL generations."""
+        self._prefetch_since_cleanup += 1
+        if self._prefetch_since_cleanup >= self.PREFETCH_CLEANUP_INTERVAL:
+            self._prefetch_since_cleanup = 0
+            self._cleanup_cache()
 
     def _cached_path(self, text: str, speed: float) -> Optional[Path]:
         if self._audio_cache is None:
@@ -386,11 +426,14 @@ class TTSEngine:
     def _play_cached_file(
         self, path: Path, generation_id: Optional[int] = None
     ) -> None:
+        # Copy to a private temp file so a concurrent cache cleanup/clear can't
+        # delete the file mid-playback; stream the copy rather than loading the
+        # whole clip into memory.
         tmp = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 tmp = Path(f.name)
-                f.write(path.read_bytes())
+            shutil.copyfile(path, tmp)
             self._play_file(str(tmp), generation_id)
         finally:
             if tmp is not None:
