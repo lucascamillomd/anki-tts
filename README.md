@@ -59,7 +59,7 @@ Buttons:
 
 - **Pause / Resume** — hold background generation after the current clip (for this Anki session only; it is not saved). Quitting Anki is never blocked by a paused worker.
 - **Warm all** — rescan every card and queue missing audio.
-- **Retry failed** — retry failed clips now instead of waiting for their backoff (runs a full card rescan only if old failures from a previous version have no stored text).
+- **Retry failed** — clear the retry backoff and walk the backlog from its first card, 1,000 cards at a time, so every failed clip is retried in one pass (runs a full card rescan only if old failures from a previous version have no stored text).
 - **Clear cache...** — delete all cached audio after confirmation; files are removed in the background.
 - **Open cache folder** / **Open log** — open `user_files/audio_cache/` or the folder with `user_files/anki_tts.log`.
 

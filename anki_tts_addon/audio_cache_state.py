@@ -121,26 +121,10 @@ class AudioCacheState:
             next_retry_at = entry.get("next_retry_at")
             return next_retry_at is None or self._timestamp() >= next_retry_at
 
-    def retry_candidates(self):
-        """(key, text) for failed entries whose backoff has expired."""
-        with self._lock:
-            now = self._timestamp()
-            return [
-                (key, entry["text"])
-                for key, entry in self._entries.items()
-                if entry.get("status") == "failed"
-                and entry.get("text")
-                and (
-                    entry.get("next_retry_at") is None
-                    or now >= entry["next_retry_at"]
-                )
-            ]
-
     def retry_failures_now(self):
         """Make every failed entry retryable immediately (resets backoff).
 
-        Entries keep their stored text, so the next warm job re-queues them
-        via retry_candidates() without re-rendering cards. Returns the count.
+        The cards are re-queued by the next backlog scan. Returns the count.
         """
         with self._lock:
             count = 0
@@ -302,12 +286,17 @@ class AudioCacheState:
         # (older versions logged a generic "prefetch failed") can't be retried
         # from here and their backoff would make scans skip the card, so they
         # are dropped and the card is simply re-found by the next scan.
+        # "Edge TTS not installed" was once recorded per card; it is an
+        # install problem, not a card failure, so those entries are dropped.
         loaded = {
             str(key): self._normalize_entry(entry)
             for key, entry in entries.items()
             if isinstance(entry, dict)
             and entry.get("status") == "failed"
             and entry.get("text")
+            and not str(entry.get("last_error") or "").startswith(
+                "Edge TTS not installed"
+            )
         }
         if len(loaded) != len(entries):
             # Drop legacy/pending/succeeded entries from disk on next flush.

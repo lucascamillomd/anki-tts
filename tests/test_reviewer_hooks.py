@@ -1945,24 +1945,55 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(prefetcher.enqueued, [])
         self.assertIsNone(self.addon._warm_job)
 
-    def test_failed_items_with_text_are_retried_without_rescanning_card(self):
+    def test_incremental_scan_queue_is_bounded_by_the_backlog_slice(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.addon._audio_cache = self.addon.AudioCache(root / "cache")
             state = self._new_cache_state(root / "state.json", now=lambda: 0)
             self.addon._audio_cache_state = state
-            collection, prefetcher = self._set_up_auto_warm({})
-            # First (full) scan commits the watermark.
+            self.addon.BACKLOG_SCAN_CARDS = 2
+            cards = {i: _FakeDueCard(i, f"card {i}") for i in range(1, 6)}
+            collection, prefetcher = self._set_up_auto_warm(cards)
+            self.addon.on_sync_did_finish()  # full scan queues all 5
+            self._run_all_timers()
+            for text, conf in prefetcher.enqueued:
+                key = self._cache_key(text)
+                state.mark_failed(key, "request timed out", text)
+                prefetcher.result_callback(text, conf, False, "timed out")
+            prefetcher.enqueued.clear()
+            state._now = lambda: 10_000  # every backoff has expired
+
             self.addon.on_sync_did_finish()
             self._run_all_timers()
 
-            state.mark_failed(self._cache_key("old failure"), "boom", "old failure")
-            state._now = lambda: 10_000
-            self.addon.on_sync_did_finish()
+            # Only the 2-card slice, not all 5 stored failures.
+            self.assertEqual(
+                [text for text, _ in prefetcher.enqueued], ["card 1", "card 2"]
+            )
+
+    def test_retry_failed_rewinds_the_backlog_to_its_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json", now=lambda: 0)
+            self.addon._audio_cache_state = state
+            self.addon.BACKLOG_SCAN_CARDS = 2
+            cards = {i: _FakeDueCard(i, f"card {i}") for i in range(1, 6)}
+            collection, prefetcher = self._set_up_auto_warm(cards)
+            self.addon.on_sync_did_finish()  # full scan
+            self._run_all_timers()
+            state.mark_failed(self._cache_key("card 1"), "boom", "card 1")
+            self.addon.on_sync_did_finish()  # slice 1-2, cursor moves on
+            self._run_all_timers()
+            for text, conf in prefetcher.enqueued:
+                prefetcher.result_callback(text, conf, False, "boom")
+            prefetcher.enqueued.clear()
+            collection.get_card_ids.clear()
+
+            self.addon.retry_failed_audio_cache()
             self._run_all_timers()
 
-            self.assertEqual(collection.find_queries, [""])
-            self.assertEqual(prefetcher.enqueued, [("old failure", _DEFAULT_CONFIG)])
+            self.assertEqual(collection.get_card_ids[:2], [1, 2])
 
     def test_full_scan_prunes_failures_no_card_has_anymore(self):
         with tempfile.TemporaryDirectory() as temp_dir:

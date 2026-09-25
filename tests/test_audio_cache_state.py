@@ -218,18 +218,6 @@ class AudioCacheStateTests(unittest.TestCase):
             self.assertEqual(reloaded.entry("abc")["status"], "failed")
             self.assertEqual(reloaded.entry("abc")["attempts"], 1)
 
-    def test_retry_candidates_returns_expired_failed_entries_with_text(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            clock = Clock(100)
-            state = AudioCacheState(Path(tmpdir) / "state.json", now=clock)
-            state.mark_failed("a", "boom", "text a")
-            state.mark_failed("b", "boom")
-
-            self.assertEqual(state.retry_candidates(), [])
-            clock.value = 130
-
-            self.assertEqual(state.retry_candidates(), [("a", "text a")])
-
     def test_meta_round_trips_through_flush(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
@@ -379,6 +367,20 @@ class AudioCacheStateTests(unittest.TestCase):
 
 
 class RetryFailuresTests(unittest.TestCase):
+    def test_module_missing_failures_are_dropped_on_load(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            path.write_text(json.dumps({"version": 1, "entries": {
+                "gone": {"status": "failed", "attempts": 3, "text": "hi",
+                         "last_error": "Edge TTS not installed: missing "
+                                       "module: edge_tts"},
+                "real": {"status": "failed", "attempts": 1, "text": "yo",
+                         "last_error": "request timed out"},
+            }}), encoding="utf-8")
+            state = AudioCacheState(path, now=Clock(100))
+            self.assertIsNone(state.entry("gone"))
+            self.assertIsNotNone(state.entry("real"))
+
     def test_retry_failures_now_clears_backoff_but_keeps_failures_on_disk(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
@@ -390,10 +392,7 @@ class RetryFailuresTests(unittest.TestCase):
             self.assertEqual(state.retry_failures_now(), 2)
 
             self.assertTrue(state.can_retry("k1"))
-            self.assertEqual(
-                sorted(state.retry_candidates()),
-                [("k1", "hello"), ("k2", "world")],
-            )
+            self.assertTrue(state.can_retry("k2"))
             state.flush()
             reloaded = AudioCacheState(path, now=Clock(100))
             self.assertEqual(reloaded.summary()["failed"], 2)

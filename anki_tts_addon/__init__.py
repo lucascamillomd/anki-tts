@@ -1004,9 +1004,9 @@ def _on_warm_scan_done(job: dict, result: dict) -> None:
             # A full scan saw every card: failures it didn't re-find are for
             # text no card has any more (older extraction, edited cards).
             state.prune_failures(items.keys())
-        else:
-            for key, text in state.retry_candidates():
-                items.setdefault(key, text)
+        # Failed cards are retried through the backlog (re-rendered, so never
+        # stale text), one slice at a time; queueing every stored retry
+        # candidate here rebuilt an 18k-clip queue on each launch.
         if result.get("watermark") is not None:
             # Commit now, not when the queue drains: with a 30k backlog the
             # worker rarely drains before quit, which forced a full rescan on
@@ -1558,7 +1558,20 @@ def retry_failed_audio_cache():
     if count == 0 and not full:
         _show_tooltip("No failed TTS audio to retry")
         return
+    _rewind_backlog()
     _start_warm_job(full=full, manual=True)
+
+
+def _rewind_backlog() -> None:
+    """Restart the backlog from its first card so one pass retries them all."""
+    collection = mw.col
+    if collection is None:
+        return
+    state = audio_cache_state()
+    meta_key = _watermark_meta_key(collection)
+    value = state.get_meta(meta_key)
+    if isinstance(value, dict) and value.get("backlog_cursor"):
+        state.set_meta(meta_key, dict(value, backlog_cursor=0))
 
 
 def _open_folder(path) -> None:
