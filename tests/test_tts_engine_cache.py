@@ -1,4 +1,5 @@
 import sys
+import asyncio
 import tempfile
 import threading
 import unittest
@@ -49,6 +50,15 @@ class FailingEdgeTTS:
 
         async def save(self, path):
             raise RuntimeError("cannot connect to Edge service")
+
+
+class HangingEdgeTTS:
+    class Communicate:
+        def __init__(self, text, voice, rate):
+            pass
+
+        async def save(self, path):
+            await asyncio.Event().wait()
 
 
 class CleanupRecordingCache(AudioCache):
@@ -292,6 +302,20 @@ class TTSEngineCacheTests(unittest.TestCase):
 
             self.assertFalse(result)
 
+    def test_prefetch_timeout_does_not_stop_later_cards(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = AudioCache(Path(tmpdir))
+            engine = TTSEngine(audio_cache=cache)
+            engine.EDGE_REQUEST_TIMEOUT_SECONDS = 0.01
+            engine._get_edge_tts = lambda: HangingEdgeTTS
+
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING"):
+                self.assertFalse(engine.prefetch("stuck", {"speed": 1.5}))
+
+            self.assertFalse(engine._edge_tts_failed)
+            engine._get_edge_tts = lambda: FakeEdgeTTS
+            self.assertTrue(engine.prefetch("next", {"speed": 1.5}))
+
     def test_prefetch_cleanup_runs_periodically_not_after_every_card(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = CleanupRecordingCache(Path(tmpdir))
@@ -343,32 +367,19 @@ class TTSEngineCacheTests(unittest.TestCase):
             self.assertEqual(cache.path_for_key(key).read_bytes(), FAKE_EDGE_BYTES)
             self.assertEqual(results, [True])
 
-    def test_prefetch_short_circuits_when_edge_already_failed(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = AudioCache(Path(tmpdir))
-            engine = TTSEngine(audio_cache=cache)
-            engine._edge_tts_failed = True
-
-            def fail_edge_load():
-                raise AssertionError("Edge must not be invoked once it failed")
-
-            engine._get_edge_tts = fail_edge_load
-
-            result = engine.prefetch("hello", {"speed": 1.5})
-
-            self.assertFalse(result)
-
-    def test_prefetch_genuine_failure_latches_edge_failed(self):
+    def test_prefetch_failure_does_not_disable_later_cards(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = AudioCache(Path(tmpdir))
             engine = TTSEngine(audio_cache=cache)
             engine._get_edge_tts = lambda: FailingEdgeTTS
 
             with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING"):
-                result = engine.prefetch("hello", {"speed": 1.5})
+                with self.assertRaises(RuntimeError):
+                    engine.prefetch("first", {"speed": 1.5})
 
-            self.assertFalse(result)
-            self.assertTrue(engine._edge_tts_failed)
+            self.assertFalse(engine._edge_tts_failed)
+            engine._get_edge_tts = lambda: FakeEdgeTTS
+            self.assertTrue(engine.prefetch("next", {"speed": 1.5}))
 
     def test_prefetch_too_small_audio_does_not_latch_edge_failed(self):
         with tempfile.TemporaryDirectory() as tmpdir:

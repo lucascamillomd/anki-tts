@@ -110,6 +110,7 @@ class TTSEngine:
     """Manages TTS with fallback: Edge TTS -> system voice."""
 
     EDGE_VOICE = "en-GB-RyanNeural"
+    EDGE_REQUEST_TIMEOUT_SECONDS = 30
 
     # Run the (directory-scanning) cache cleanup only once per this many
     # prefetch generations, instead of after every card, to avoid O(N^2)
@@ -273,11 +274,6 @@ class TTSEngine:
         if not text or self._audio_cache is None:
             return False
 
-        # Don't keep hammering Edge for every warm-up card once it is known
-        # to be unavailable; the live path shares the same failure latch.
-        if self._edge_tts_failed:
-            return False
-
         speed = config.get("speed", 1.5)
         if self._cached_path(text, speed) is not None:
             return True
@@ -298,10 +294,14 @@ class TTSEngine:
         except AudioTooSmallError as e:
             log.warning("Edge TTS prefetch produced unusable audio: %s", e)
             return False
-        except Exception as e:
-            log.warning("Edge TTS prefetch failed: %s", e)
-            self._edge_tts_failed = True
+        except TimeoutError as e:
+            log.warning("Edge TTS prefetch timed out: %s", e)
             return False
+        except Exception:
+            # A transient Edge error must not disable the remaining cache queue.
+            # Let the worker record the real error for this card and continue.
+            log.warning("Edge TTS prefetch failed", exc_info=True)
+            raise
         else:
             self._maybe_cleanup_cache()
             return True
@@ -451,7 +451,9 @@ class TTSEngine:
 
         async def _generate(tmp_path: str):
             comm = edge_tts.Communicate(text, self.EDGE_VOICE, rate=rate_str)
-            await comm.save(tmp_path)
+            await asyncio.wait_for(
+                comm.save(tmp_path), timeout=self.EDGE_REQUEST_TIMEOUT_SECONDS
+            )
 
         asyncio.run(_generate(os.fspath(path)))
 
