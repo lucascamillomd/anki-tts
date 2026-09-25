@@ -23,6 +23,7 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip
 from typing import Optional
+import bisect
 import hashlib
 import logging
 import os
@@ -83,6 +84,12 @@ ALL_CARDS_SEARCH = ""
 # Bump when question-text extraction changes so the next warm-up rescans
 # every card instead of trusting the incremental watermark.
 WARM_TEXT_VERSION = 3
+# Backlog cards (audio still missing at the last scan) rendered per scan. The
+# worker makes ~1 clip/s, so larger slices would only re-render cards that
+# can't be generated before the next scan anyway. The rest carries over and
+# the next slice is scanned when the worker drains.
+BACKLOG_SCAN_CARDS = 1000
+BACKLOG_REFILL_DELAY_MS = 2000
 # Background scan chunking (see _scan_step): cards per collection op, a
 # time cap per op, and the pause between ops.
 SCAN_CHUNK_CARDS = 200
@@ -480,7 +487,8 @@ _warm_scheduled = False
 _warm_schedule_token = 0
 _idle_seen_during_queueing = False
 _manual_notify_pending = False
-_pending_watermark: Optional[tuple] = None
+# Unscanned backlog cards remain: scan the next slice when the worker drains.
+_backlog_refill_pending = False
 _quit_hook_registered = False
 
 # Live counters for status/monitor UIs; guarded by _stats_lock.
@@ -525,6 +533,40 @@ def _watermark_meta_key(collection) -> str:
     return f"warm_watermark:{getattr(collection, 'path', '') or ''}"
 
 
+def _encode_card_ids(card_ids) -> str:
+    """Compact form for the backlog: sorted ids as base-36 deltas.
+
+    Card ids are 13-digit millisecond timestamps; deltas between sorted ids
+    are small, so 30k ids take ~150 KB instead of ~450 KB of JSON numbers.
+    """
+    out, previous = [], 0
+    for card_id in sorted(set(int(i) for i in card_ids)):
+        out.append(_to_base36(card_id - previous))
+        previous = card_id
+    return ",".join(out)
+
+
+def _decode_card_ids(value) -> list:
+    if not isinstance(value, str) or not value:
+        return []
+    ids, current = [], 0
+    for part in value.split(","):
+        current += int(part, 36)
+        ids.append(current)
+    return ids
+
+
+def _to_base36(number: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if number == 0:
+        return "0"
+    out = []
+    while number:
+        number, rem = divmod(number, 36)
+        out.append(digits[rem])
+    return "".join(reversed(out))
+
+
 def _load_watermark(collection, conf: dict) -> Optional[dict]:
     value = audio_cache_state().get_meta(_watermark_meta_key(collection))
     if not isinstance(value, dict):
@@ -537,6 +579,8 @@ def _load_watermark(collection, conf: dict) -> Optional[dict]:
             "mod": int(value["mod"]),
             "usn": int(value["usn"]),
             "notetypes": notetypes if isinstance(notetypes, dict) else None,
+            "backlog": _decode_card_ids(value.get("backlog")),
+            "backlog_cursor": int(value.get("backlog_cursor") or 0),
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -595,7 +639,33 @@ def _select_card_ids(col, since: Optional[dict], notetype_ids=()) -> list:
     if notetype_ids:
         # Ids are ints from our own digest map, so inlining them is safe.
         sql += " or n.mid in (%s)" % ",".join(str(int(i)) for i in notetype_ids)
-    return list(col.db.list(sql, mod, mod, usn, usn))
+    changed = list(col.db.list(sql, mod, mod, usn, usn))
+    # Cards whose audio was still missing at the last scan: rescanning just
+    # these (not the whole collection) finds what the worker didn't finish.
+    backlog = since.get("backlog") or []
+    return list(dict.fromkeys(list(changed) + list(backlog)))
+
+
+def _split_backlog(since: Optional[dict]):
+    """Pick the backlog slice to scan now, continuing from the saved cursor.
+
+    Returns (slice, rest, next_cursor, more). Resuming at the cursor (not the
+    start) matters: cards stuck in retry backoff stay missing, and restarting
+    from the lowest ids would rescan them forever and never reach the rest.
+    ``more`` is False once the slice reaches the end, so a refill chain makes
+    at most one pass; the next launch/sync wraps around to the start.
+    """
+    since = since or {}
+    backlog = sorted(since.get("backlog") or [])
+    if not backlog:
+        return [], [], 0, False
+    start = bisect.bisect_left(backlog, int(since.get("backlog_cursor") or 0))
+    if start >= len(backlog):
+        start = 0
+    end = start + BACKLOG_SCAN_CARDS
+    head = backlog[start:end]
+    rest = backlog[:start] + backlog[end:]
+    return head, rest, head[-1] + 1, end < len(backlog)
 
 
 def _max_usn(col) -> int:
@@ -620,6 +690,8 @@ def _new_scan_result(full: bool) -> dict:
         "errors": 0,
         "aborted": False,
         "watermark": None,
+        "missing_card_ids": [],
+        "backlog_more": False,
     }
 
 
@@ -629,6 +701,9 @@ def _scan_begin(col, since, conf, cache, cancel_event) -> dict:
         "started": int(time.time()),
         "max_usn": None,
         "notetype_hashes": None,
+        "backlog_rest": [],
+        "backlog_cursor": 0,
+        "backlog_more": False,
         "card_ids": [],
         "next": 0,
         "cached_keys": set(),
@@ -647,7 +722,18 @@ def _scan_begin(col, since, conf, cache, cancel_event) -> dict:
     changed_notetypes = (
         _changed_notetype_ids(since, scan["notetype_hashes"]) if since else ()
     )
+    if since is not None:
+        head, scan["backlog_rest"], scan["backlog_cursor"], scan[
+            "backlog_more"
+        ] = _split_backlog(since)
+        since = dict(since, backlog=head)
     scan["card_ids"] = _select_card_ids(col, since, changed_notetypes)
+    if scan["backlog_rest"]:
+        # A changed card may also sit in the unscanned rest: scan it now.
+        scanned = set(scan["card_ids"])
+        scan["backlog_rest"] = [
+            i for i in scan["backlog_rest"] if i not in scanned
+        ]
     result["cards"] = len(scan["card_ids"])
     _warm_stats.scan_progress(0, len(scan["card_ids"]))
     scan["cached_keys"] = cache.cached_keys()
@@ -690,17 +776,23 @@ def _scan_step(col, scan, conf, cancel_event) -> dict:
                 result["cached"] += 1
             else:
                 result["missing"].setdefault(key, text)
+                result["missing_card_ids"].append(card_id)
         if time.monotonic() >= deadline:
             break
     scan["next"] = index
     _warm_stats.scan_progress(index)
     if not result["aborted"] and index >= len(card_ids):
         scan["done"] = True
+        result["backlog_more"] = scan["backlog_more"]
         if scan["max_usn"] is not None:
             result["watermark"] = {
                 "mod": scan["started"] - 2,
                 "usn": scan["max_usn"],
                 "notetypes": scan["notetype_hashes"],
+                "backlog": _encode_card_ids(
+                    result["missing_card_ids"] + scan["backlog_rest"]
+                ),
+                "backlog_cursor": scan["backlog_cursor"],
                 "signature": _scan_signature(conf),
             }
     return scan
@@ -896,7 +988,7 @@ def _on_warm_scan_failed(job: dict, error) -> None:
 
 
 def _on_warm_scan_done(job: dict, result: dict) -> None:
-    global _pending_watermark
+    global _backlog_refill_pending
     try:
         if not _warm_job_is_current(job) or result.get("aborted"):
             return
@@ -908,8 +1000,22 @@ def _on_warm_scan_done(job: dict, result: dict) -> None:
         # are still queueing update the new counters, not stale ones.
         _record_scan_stats(result)
         items = dict(result["missing"])
-        for key, text in state.retry_candidates():
-            items.setdefault(key, text)
+        if result.get("full"):
+            # A full scan saw every card: failures it didn't re-find are for
+            # text no card has any more (older extraction, edited cards).
+            state.prune_failures(items.keys())
+        else:
+            for key, text in state.retry_candidates():
+                items.setdefault(key, text)
+        if result.get("watermark") is not None:
+            # Commit now, not when the queue drains: with a 30k backlog the
+            # worker rarely drains before quit, which forced a full rescan on
+            # every launch. Unfinished cards are carried in the backlog.
+            state.set_meta(
+                _watermark_meta_key(job["collection"]), result["watermark"]
+            )
+            _flush_state_in_background()
+            _backlog_refill_pending = bool(result.get("backlog_more"))
 
         queued = 0
         for index, (key, text) in enumerate(items.items()):
@@ -939,11 +1045,6 @@ def _on_warm_scan_done(job: dict, result: dict) -> None:
         with _stats_lock:
             if _scan_stats["last_scan"] is not None:
                 _scan_stats["last_scan"]["queued"] = queued
-        if result.get("watermark") is not None:
-            _pending_watermark = (
-                _watermark_meta_key(job["collection"]),
-                result["watermark"],
-            )
     except Exception:
         log.exception("TTS audio warm-up failed")
         _record_last_error("warm-up failed")
@@ -1140,7 +1241,7 @@ def _on_prefetch_idle_main() -> None:
 
 def _prefetch_idle_main() -> None:
     global _idle_seen_during_queueing, _manual_notify_pending
-    global _pending_watermark
+    global _backlog_refill_pending
     if _shutting_down:
         return
     with _warm_lock:
@@ -1153,11 +1254,11 @@ def _prefetch_idle_main() -> None:
         if status.get("pending", 0) or status.get("active", 0):
             return
 
-    if _pending_watermark is not None:
-        meta_key, value = _pending_watermark
-        _pending_watermark = None
-        audio_cache_state().set_meta(meta_key, value)
     _flush_state_in_background()
+
+    if _backlog_refill_pending and not _user_paused:
+        _backlog_refill_pending = False
+        _schedule_auto_warm_all_audio_cache(BACKLOG_REFILL_DELAY_MS)
 
     if _manual_notify_pending:
         _manual_notify_pending = False
@@ -1304,7 +1405,6 @@ def _reset_scan_stats() -> None:
 
 def clear_audio_cache():
     """Stop background audio generation and remove cached TTS audio files."""
-    global _pending_watermark
     _cancel_running_warm_job()
     if _engine is not None:
         _engine.stop()
@@ -1326,7 +1426,6 @@ def clear_audio_cache():
             return
 
     cache = audio_cache()
-    _pending_watermark = None
     _reset_scan_stats()
     _warm_stats.clear_errors()
     audio_cache_state().clear()
@@ -1443,6 +1542,9 @@ def toggle_pause_audio_cache():
             worker.pause()
         elif not _user_paused and hasattr(worker, "resume"):
             worker.resume()
+    if not _user_paused:
+        # A backlog refill skipped while paused would otherwise never run.
+        _on_prefetch_idle_main()
     log.info("TTS background generation %s", "paused" if _user_paused else "resumed")
 
 
@@ -1568,12 +1670,22 @@ def _on_app_about_to_quit() -> None:
         log.warning("TTS shutdown on quit failed", exc_info=True)
 
 
+# (description, milliseconds) of the shutdown steps being timed, or None.
+_shutdown_timings: Optional[list] = None
+
+
 def _safely(step, description: str) -> None:
     """Run one shutdown step; a failure must never abort the rest."""
+    started = time.perf_counter()
     try:
         step()
     except Exception:
         log.warning("TTS shutdown: %s failed", description, exc_info=True)
+    finally:
+        if _shutdown_timings is not None:
+            _shutdown_timings.append(
+                (description, (time.perf_counter() - started) * 1000)
+            )
 
 
 def _shutdown_background_work() -> None:
@@ -1583,8 +1695,24 @@ def _shutdown_background_work() -> None:
     exception would show Anki's error dialog and skip the remaining cleanup
     (leaving threads running into quit).
     """
-    global _shutting_down
+    global _shutting_down, _shutdown_timings
     _shutting_down = True
+    _shutdown_timings = []
+    started = time.perf_counter()
+    try:
+        _shutdown_steps()
+    finally:
+        timings, _shutdown_timings = _shutdown_timings, None
+        total = (time.perf_counter() - started) * 1000
+        slow = ", ".join(
+            f"{name} {ms:.0f} ms" for name, ms in timings if ms >= 5
+        )
+        # Lets quit-time reports separate our share from Anki's own close.
+        log.info("TTS shutdown took %.0f ms%s", total,
+                 f" ({slow})" if slow else "")
+
+
+def _shutdown_steps() -> None:
     set_status_callback(None)
     _safely(_cancel_scheduled_auto_warm, "cancel scheduled scan")
     _safely(_cancel_running_warm_job, "cancel scan")
@@ -1701,7 +1829,7 @@ def _on_profile_did_open():
 def _on_profile_will_close():
     global _engine, _engine_cache_enabled, _hooks_registered
     global _audio_cache, _audio_cache_state, _sync_in_progress
-    global _pending_watermark, _manual_notify_pending
+    global _manual_notify_pending, _backlog_refill_pending
     global _warm_job, _warm_rescan
     try:
         monitor_ui.teardown()
@@ -1716,8 +1844,8 @@ def _on_profile_will_close():
     with _warm_lock:
         _warm_job = None
         _warm_rescan = None
-    _pending_watermark = None
     _manual_notify_pending = False
+    _backlog_refill_pending = False
     _sync_in_progress = False
     _reset_scan_stats()
 

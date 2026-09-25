@@ -154,6 +154,20 @@ class AudioCacheState:
                 self._dirty = True
             return count
 
+    def prune_failures(self, keep_keys):
+        """Drop failed entries whose key is not in ``keep_keys``; return count."""
+        keep = set(keep_keys)
+        with self._lock:
+            stale = [
+                key for key, entry in self._entries.items()
+                if entry.get("status") == "failed" and key not in keep
+            ]
+            for key in stale:
+                del self._entries[key]
+            if stale:
+                self._dirty = True
+            return len(stale)
+
     def has_failures_without_text(self):
         """True when some failed entry can only be retried by a card rescan."""
         with self._lock:

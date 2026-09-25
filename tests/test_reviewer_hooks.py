@@ -980,7 +980,8 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(len(self.hooks.timers), 1)
         self._run_next_timer()
 
-        self.assertEqual(self.hooks.timers, [])
+        # Only background work (the state flush) may remain; no UI batches.
+        self.assertEqual(self._delayed_timers(), [])
         self.assertEqual(len(collection.get_card_ids), 50)
         self.assertEqual(len(prefetcher.enqueued), 50)
 
@@ -1662,42 +1663,49 @@ class ReviewerHookTests(unittest.TestCase):
             )
 
     def test_idle_handler_errors_never_escape_to_anki(self):
-        self.addon._pending_watermark = ("key", {"mod": 1})
-
-        def broken_state():
+        def broken_flush():
             raise OSError("disk full")
 
-        self.addon.audio_cache_state = broken_state
+        self.addon._flush_state_in_background = broken_flush
         with self.assertLogs(self.addon.log, level="WARNING"):
             self.addon._on_prefetch_idle_main()
 
     def test_sync_uses_incremental_scan_after_watermark_is_committed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            cache = self.addon.AudioCache(root / "cache")
+            self.addon._audio_cache = cache
             self.addon._audio_cache_state = self._new_cache_state(root / "state.json")
+            self._write_cached_audio(cache, "one")
             collection, prefetcher = self._set_up_auto_warm(
-                {1: _FakeDueCard(1, "one"), 2: _FakeDueCard(2, "two")}
+                {1: _FakeDueCard(1, "one"), 2: _FakeDueCard(2, "two"),
+                 3: _FakeDueCard(3, "three")}
             )
 
             self.addon.on_sync_did_finish()
             self._run_all_timers()
             self.assertEqual(collection.find_queries, [""])
-            prefetcher.result_callback("one", _DEFAULT_CONFIG, True, None)
-            prefetcher.result_callback("two", _DEFAULT_CONFIG, True, None)
-            prefetcher.idle_callback()
-            self._run_all_timers()
+            self._write_cached_audio(cache, "two")
 
-            collection.changed_ids = [2]
+            collection.changed_ids = [1]
             collection.get_card_ids.clear()
             self.addon.on_sync_did_finish()
             self._run_all_timers()
 
+            # Incremental: changed card 1 plus the backlog of cards whose
+            # audio was missing at the last scan (2 and 3), not a full scan.
             self.assertEqual(collection.find_queries, [""])
             self.assertEqual(len(collection.db.list_queries), 1)
-            self.assertEqual(collection.get_card_ids, [2])
+            self.assertEqual(collection.get_card_ids, [1, 2, 3])
 
-    def test_watermark_not_committed_while_queued_audio_is_unfinished(self):
+            # Card 2 got cached meanwhile, so only 3 stays in the backlog.
+            collection.changed_ids = []
+            collection.get_card_ids.clear()
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+            self.assertEqual(collection.get_card_ids, [3])
+
+    def test_watermark_committed_at_scan_end_even_with_unfinished_queue(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.addon._audio_cache = self.addon.AudioCache(root / "cache")
@@ -1708,12 +1716,69 @@ class ReviewerHookTests(unittest.TestCase):
 
             self.addon.on_sync_did_finish()
             self._run_all_timers()
+            # Quit/relaunch before the worker drained: the unfinished card
+            # comes back via the backlog; no full 30k-card rescan.
             self.addon.on_sync_did_finish()
             self._run_all_timers()
 
-            # Quit before the worker drained: next pass must scan everything.
-            self.assertEqual(collection.find_queries, ["", ""])
-            self.assertEqual(collection.db.list_queries, [])
+            self.assertEqual(collection.find_queries, [""])
+            self.assertEqual(len(collection.db.list_queries), 1)
+            self.assertEqual(collection.get_card_ids, [1, 1])
+
+    def test_backlog_is_scanned_in_slices_and_refilled_when_idle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            self.addon._audio_cache_state = self._new_cache_state(root / "state.json")
+            self.addon.BACKLOG_SCAN_CARDS = 2
+            cards = {i: _FakeDueCard(i, f"card {i}") for i in range(1, 6)}
+            collection, prefetcher = self._set_up_auto_warm(cards)
+
+            def worker_drains():
+                # Clips "finish" (as failures, so the cards stay missing and
+                # in the backlog), then the worker reports idle.
+                for text, conf in prefetcher.enqueued:
+                    prefetcher.result_callback(text, conf, True, None)
+                prefetcher.enqueued.clear()
+                collection.get_card_ids.clear()
+                prefetcher.idle_callback()
+                self._run_all_timers()
+                return list(collection.get_card_ids)
+
+            self.addon.on_sync_did_finish()  # full scan: all 5 missing
+            self._run_all_timers()
+            self.assertEqual(worker_drains(), [])  # full scan: no backlog chain
+
+            collection.get_card_ids.clear()
+            self.addon.on_sync_did_finish()  # restart-like incremental scan
+            self._run_all_timers()
+            self.assertEqual(collection.get_card_ids, [1, 2])
+
+            self.assertEqual(worker_drains(), [3, 4])
+            self.assertEqual(worker_drains(), [5])
+            # End of the backlog: the chain stops instead of rescanning cards
+            # that stay missing (e.g. in retry backoff) forever...
+            self.assertEqual(worker_drains(), [])
+
+            # ...and the next launch/sync wraps around to the start.
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+            self.assertEqual(collection.get_card_ids, [1, 2])
+
+    def test_shutdown_logs_its_duration(self):
+        with self.assertLogs(self.addon.log, level="INFO") as logs:
+            self.addon._shutdown_background_work()
+        self.assertTrue(
+            any("TTS shutdown took" in line for line in logs.output)
+        )
+        self.assertIsNone(self.addon._shutdown_timings)
+
+    def test_card_id_backlog_round_trips(self):
+        ids = [1650643472207, 1650643472208, 1700000000000, 5]
+        encoded = self.addon._encode_card_ids(ids)
+        self.assertEqual(self.addon._decode_card_ids(encoded), sorted(ids))
+        self.assertEqual(self.addon._decode_card_ids(""), [])
+        self.assertEqual(self.addon._decode_card_ids(None), [])
 
     def test_speed_change_forces_full_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1885,15 +1950,39 @@ class ReviewerHookTests(unittest.TestCase):
             root = Path(temp_dir)
             self.addon._audio_cache = self.addon.AudioCache(root / "cache")
             state = self._new_cache_state(root / "state.json", now=lambda: 0)
-            state.mark_failed(self._cache_key("old failure"), "boom", "old failure")
             self.addon._audio_cache_state = state
-            state._now = lambda: 10_000
             collection, prefetcher = self._set_up_auto_warm({})
+            # First (full) scan commits the watermark.
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+
+            state.mark_failed(self._cache_key("old failure"), "boom", "old failure")
+            state._now = lambda: 10_000
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+
+            self.assertEqual(collection.find_queries, [""])
+            self.assertEqual(prefetcher.enqueued, [("old failure", _DEFAULT_CONFIG)])
+
+    def test_full_scan_prunes_failures_no_card_has_anymore(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json", now=lambda: 0)
+            state.mark_failed(self._cache_key("stale text"), "boom", "stale text")
+            state.mark_failed(self._cache_key("one"), "boom", "one")
+            state._now = lambda: 10_000
+            self.addon._audio_cache_state = state
+            _collection, prefetcher = self._set_up_auto_warm(
+                {1: _FakeDueCard(1, "one")}
+            )
 
             self.addon.on_sync_did_finish()
             self._run_all_timers()
 
-            self.assertEqual(prefetcher.enqueued, [("old failure", _DEFAULT_CONFIG)])
+            self.assertIsNone(state.entry(self._cache_key("stale text")))
+            self.assertIsNotNone(state.entry(self._cache_key("one")))
+            self.assertEqual(prefetcher.enqueued, [("one", _DEFAULT_CONFIG)])
 
     def test_profile_open_registers_quit_hook_once(self):
         connected = []
