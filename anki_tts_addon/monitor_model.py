@@ -536,6 +536,10 @@ def toolbar_update_js(element_id: str, s: MonitorSnapshot) -> str:
         "(function(){"
         f"var el=document.getElementById({_js_str(element_id)});"
         "if(!el)return;"
+        # Other add-ons (e.g. Anki Terminator) insert toolbar links at fixed
+        # indexes after our hook runs; re-anchor the icon right after Sync.
+        "var s=document.getElementById('sync');"
+        "if(s&&s.nextElementSibling!==el)s.after(el);"
         f"el.dataset.state={_js_str(state.value)};"
         f"el.title={_js_str(tip)};"
         f"el.setAttribute('aria-label',{_js_str(tip)});"

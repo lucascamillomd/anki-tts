@@ -115,7 +115,7 @@ This produces `anki_tts.ankiaddon` — install it via Anki's add-on manager.
 
 ### Prerequisites for Building
 
-The `anki_tts_addon/vendor/` directory must contain the bundled Python dependencies for Edge TTS (for example `edge-tts`, `aiohttp`, and their dependencies) compiled for your target platform. These are not checked into git due to size.
+Edge TTS (`edge-tts`, `aiohttp` and their dependencies) is bundled under `anki_tts_addon/vendor/`, which is not checked into git. `build_addon.sh` fills it automatically with `python3 -m pip` using wheels for Anki's embedded Python (CPython 3.13, macOS arm64 by default), and refuses to build if `edge_tts` is missing. Override the target with `ANKI_PY_VERSION` / `ANKI_PY_PLATFORM` (e.g. `ANKI_PY_PLATFORM=macosx_10_13_x86_64` for Intel Macs) and force a refresh with `REFRESH_VENDOR=1`.
 
 ## Project Structure
 

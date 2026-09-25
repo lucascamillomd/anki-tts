@@ -23,6 +23,7 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip
 from typing import Optional
+import hashlib
 import logging
 import os
 import threading
@@ -81,7 +82,7 @@ TEMP_FILE_MIN_AGE_SECONDS = 300
 ALL_CARDS_SEARCH = ""
 # Bump when question-text extraction changes so the next warm-up rescans
 # every card instead of trusting the incremental watermark.
-WARM_TEXT_VERSION = 2
+WARM_TEXT_VERSION = 3
 # Background scan chunking (see _scan_step): cards per collection op, a
 # time cap per op, and the pause between ops.
 SCAN_CHUNK_CARDS = 200
@@ -530,8 +531,13 @@ def _load_watermark(collection, conf: dict) -> Optional[dict]:
         return None
     if value.get("signature") != _scan_signature(conf):
         return None
+    notetypes = value.get("notetypes")
     try:
-        return {"mod": int(value["mod"]), "usn": int(value["usn"])}
+        return {
+            "mod": int(value["mod"]),
+            "usn": int(value["usn"]),
+            "notetypes": notetypes if isinstance(notetypes, dict) else None,
+        }
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -540,14 +546,44 @@ _CHANGED_CARDS_SQL = (
     "select c.id from cards c join notes n on c.nid = n.id "
     "where c.mod > ? or n.mod > ? or c.usn > ? or n.usn > ?"
 )
-# Editing a note type's templates changes the question text of all its cards
-# without touching the cards or notes themselves.
-_CHANGED_NOTETYPE_SQL = (
-    " or n.mid in (select id from notetypes where mtime_secs > ? or usn > ?)"
-)
+_NOTETYPE_TEMPLATES_SQL = "select ntid, ord, config from templates order by ntid, ord"
 
 
-def _select_card_ids(col, since: Optional[dict]) -> list:
+def _notetype_template_hashes(col) -> Optional[dict]:
+    """Digest of each note type's templates, keyed by note type id.
+
+    Editing a template changes the question text of all its cards without
+    touching the cards or notes. The note type's own mtime/usn is useless for
+    detecting that: add-ons such as AnkiHub rewrite note types on every
+    startup/sync, which would turn each incremental scan into a full one.
+    """
+    try:
+        rows = col.db.all(_NOTETYPE_TEMPLATES_SQL)
+    except Exception:
+        log.debug("Could not read note type templates", exc_info=True)
+        return None
+    digests = {}
+    for ntid, ord_, config in rows:
+        digest = digests.setdefault(str(ntid), hashlib.sha1())
+        digest.update(str(ord_).encode())
+        if isinstance(config, str):
+            config = config.encode("utf-8")
+        digest.update(bytes(config or b""))
+    return {ntid: digest.hexdigest() for ntid, digest in digests.items()}
+
+
+def _changed_notetype_ids(since: dict, current: Optional[dict]) -> list:
+    if current is None:
+        return []
+    stored = since.get("notetypes")
+    if not isinstance(stored, dict):
+        return sorted(int(ntid) for ntid in current)
+    return sorted(
+        int(ntid) for ntid, digest in current.items() if stored.get(ntid) != digest
+    )
+
+
+def _select_card_ids(col, since: Optional[dict], notetype_ids=()) -> list:
     if since is None:
         return list(col.find_cards(ALL_CARDS_SEARCH))
     # Local edits bump mod (seconds); synced-in changes carry a server usn
@@ -555,17 +591,11 @@ def _select_card_ids(col, since: Optional[dict]) -> list:
     # selected by usn: for a collection that never syncs every row is -1,
     # which would turn each "incremental" scan into a full 30k-card render.
     mod, usn = since["mod"], since["usn"]
-    try:
-        return list(
-            col.db.list(
-                _CHANGED_CARDS_SQL + _CHANGED_NOTETYPE_SQL,
-                mod, mod, usn, usn, mod, usn,
-            )
-        )
-    except Exception:
-        log.debug("Note type change query failed; using cards/notes only",
-                  exc_info=True)
-    return list(col.db.list(_CHANGED_CARDS_SQL, mod, mod, usn, usn))
+    sql = _CHANGED_CARDS_SQL
+    if notetype_ids:
+        # Ids are ints from our own digest map, so inlining them is safe.
+        sql += " or n.mid in (%s)" % ",".join(str(int(i)) for i in notetype_ids)
+    return list(col.db.list(sql, mod, mod, usn, usn))
 
 
 def _max_usn(col) -> int:
@@ -598,6 +628,7 @@ def _scan_begin(col, since, conf, cache, cancel_event) -> dict:
     scan = {
         "started": int(time.time()),
         "max_usn": None,
+        "notetype_hashes": None,
         "card_ids": [],
         "next": 0,
         "cached_keys": set(),
@@ -612,7 +643,11 @@ def _scan_begin(col, since, conf, cache, cancel_event) -> dict:
         scan["max_usn"] = _max_usn(col)
     except Exception:
         log.debug("Could not read collection usn", exc_info=True)
-    scan["card_ids"] = _select_card_ids(col, since)
+    scan["notetype_hashes"] = _notetype_template_hashes(col)
+    changed_notetypes = (
+        _changed_notetype_ids(since, scan["notetype_hashes"]) if since else ()
+    )
+    scan["card_ids"] = _select_card_ids(col, since, changed_notetypes)
     result["cards"] = len(scan["card_ids"])
     _warm_stats.scan_progress(0, len(scan["card_ids"]))
     scan["cached_keys"] = cache.cached_keys()
@@ -665,6 +700,7 @@ def _scan_step(col, scan, conf, cancel_event) -> dict:
             result["watermark"] = {
                 "mod": scan["started"] - 2,
                 "usn": scan["max_usn"],
+                "notetypes": scan["notetype_hashes"],
                 "signature": _scan_signature(conf),
             }
     return scan
@@ -1231,7 +1267,9 @@ def _format_audio_cache_status_message(snapshot: dict) -> str:
     if failed:
         detail.append(f"{failed} failed")
     edge = snapshot["engine"].get("edge") or {}
-    if edge.get("open"):
+    if edge.get("missing"):
+        detail.append(edge.get("last_error") or "Edge TTS not installed")
+    elif edge.get("open"):
         detail.append(f"Edge paused, retry in {int(edge['retry_in'])}s")
     if snapshot["scan"]["running"]:
         detail.append("scan running")

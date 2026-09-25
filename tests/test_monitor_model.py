@@ -273,6 +273,11 @@ class ToolbarTests(unittest.TestCase):
         idle_js = M.toolbar_update_js("i", snap())
         self.assertIn("classList.toggle('tts-spin',false)", idle_js)
 
+    def test_update_js_anchors_icon_right_after_sync(self):
+        js = M.toolbar_update_js("tts", snap())
+        self.assertIn("getElementById('sync')", js)
+        self.assertIn("s.after(el)", js)
+
 
 if __name__ == "__main__":
     unittest.main()

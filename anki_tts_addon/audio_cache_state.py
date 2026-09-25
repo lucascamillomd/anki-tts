@@ -284,13 +284,19 @@ class AudioCacheState:
         entries = data.get("entries", {})
         if not isinstance(entries, dict):
             return {}
+        # Keep only retryable failures. Legacy entries without card text
+        # (older versions logged a generic "prefetch failed") can't be retried
+        # from here and their backoff would make scans skip the card, so they
+        # are dropped and the card is simply re-found by the next scan.
         loaded = {
             str(key): self._normalize_entry(entry)
             for key, entry in entries.items()
-            if isinstance(entry, dict) and entry.get("status") == "failed"
+            if isinstance(entry, dict)
+            and entry.get("status") == "failed"
+            and entry.get("text")
         }
         if len(loaded) != len(entries):
-            # Drop legacy pending/succeeded entries from disk on next flush.
+            # Drop legacy/pending/succeeded entries from disk on next flush.
             self._dirty = True
         return loaded
 

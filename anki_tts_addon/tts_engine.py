@@ -202,6 +202,7 @@ class TTSEngine:
     EDGE_REQUEST_TIMEOUT_SECONDS = 30
     PROCESS_TIMEOUT_SECONDS = 120
     STOP_WAIT_SECONDS = 0.2
+    EDGE_MISSING_PAUSE_SECONDS = 3600.0
     # Evict down to this fraction of the limit so a full cache is not
     # rescanned after every new clip.
     CLEANUP_TARGET_RATIO = 0.9
@@ -262,8 +263,25 @@ class TTSEngine:
 
     # -- status -------------------------------------------------------------
 
+    def _edge_missing_reason(self) -> Optional[str]:
+        """Why bundled edge_tts could not be imported (None when fine/unchecked)."""
+        with self._lazy_lock:
+            if not self._edge_tts_checked or self._edge_tts is not None:
+                return None
+        return "Edge TTS not installed: " + _edge_error_reason(
+            _edge_import_error or RuntimeError("edge_tts import failed")
+        )
+
     def edge_status(self) -> dict:
-        return self._breaker.snapshot()
+        status = self._breaker.snapshot()
+        missing = self._edge_missing_reason()
+        if missing is not None:
+            # A missing module is not a transient outage: report it as down
+            # (the breaker never sees it) so the monitor doesn't say "OK".
+            status.update(
+                open=True, retry_in=0.0, last_error=missing, missing=True
+            )
+        return status
 
     def live_stats(self) -> dict:
         with self._stats_lock:
@@ -280,6 +298,10 @@ class TTSEngine:
 
     def prefetch_pause_seconds(self) -> float:
         """Seconds background prefetch should wait before using Edge again."""
+        if self._edge_missing_reason() is not None:
+            # edge_tts can't appear without restarting Anki: hold the queue
+            # instead of failing (and backing off) every remaining card.
+            return self.EDGE_MISSING_PAUSE_SECONDS
         return self._breaker.prefetch_retry_in()
 
     def _count_live(self, hit: bool) -> None:
@@ -408,13 +430,9 @@ class TTSEngine:
 
         edge_tts = self._get_edge_tts()
         if edge_tts is None:
-            self._local.prefetch_error = (
-                "Edge TTS not installed: "
-                + _edge_error_reason(
-                    _edge_import_error or RuntimeError("edge_tts import failed")
-                )
-            )
-            return False
+            # Not this card's fault: leave it unfailed; the worker pauses on
+            # prefetch_pause_seconds() and the monitor shows the reason.
+            return None
 
         self._local.prefetch = True
         try:

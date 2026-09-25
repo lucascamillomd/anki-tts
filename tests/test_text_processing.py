@@ -24,6 +24,23 @@ EXAMPLE_RAW_CLOZE = (
 
 
 class ExtractSpeakableTextTests(unittest.TestCase):
+    def test_escaped_html_in_cloze_attribute_does_not_leak_answer(self):
+        # Anki stores the hidden answer HTML-escaped in data-cloze; decoding
+        # entities before stripping tags used to break the tag and speak it.
+        rendered = (
+            'Vitamin D deficiency causes <span class="cloze" '
+            'data-cloze="&lt;b&gt;hypocalcemic tetany&lt;/b&gt;" '
+            'data-ordinal="1">[...]</span>'
+        )
+
+        result = extract_speakable_text(rendered, active_ord=0)
+
+        self.assertEqual(result, "Vitamin D deficiency causes bla bla bla")
+
+    def test_escaped_angle_brackets_in_text_are_spoken(self):
+        self.assertEqual(extract_speakable_text("a &lt; b &amp;&amp; c"),
+                         "a < b && c")
+
     def test_question_masks_only_active_second_cloze(self):
         result = extract_speakable_text(EXAMPLE_RAW_CLOZE, active_ord=1)
 

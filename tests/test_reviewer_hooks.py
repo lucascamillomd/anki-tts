@@ -122,6 +122,9 @@ class _FakeDb:
     def scalar(self, _sql, *_args):
         return self.usn
 
+    def all(self, _sql, *_args):
+        return list(getattr(self.collection, "template_rows", []))
+
 
 class _FakeCollection:
     path = "/fake/collection.anki2"
@@ -1534,28 +1537,53 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(prefetcher.enqueued, [])
         self.assertIsNone(self.addon._warm_job)
 
-    def test_incremental_query_ignores_unsynced_usn_and_checks_note_types(self):
+    def test_incremental_query_ignores_unsynced_usn(self):
         collection = _FakeCollection({})
         self.addon._select_card_ids(collection, {"mod": 100, "usn": 7})
 
         sql, args = collection.db.list_queries[-1]
         self.assertNotIn("-1", sql)
-        self.assertIn("notetypes", sql)
-        self.assertEqual(args, (100, 100, 7, 7, 100, 7))
+        self.assertNotIn("n.mid", sql)
+        self.assertEqual(args, (100, 100, 7, 7))
 
-    def test_incremental_query_falls_back_without_notetypes_table(self):
-        class OldSchemaDb(_FakeDb):
-            def list(self, sql, *args):
-                if "notetypes" in sql:
-                    raise RuntimeError("no such table: notetypes")
-                return super().list(sql, *args)
-
+    def test_incremental_query_includes_only_changed_note_types(self):
         collection = _FakeCollection({})
-        collection.changed_ids = [5]
-        collection.db = OldSchemaDb(collection)
+        self.addon._select_card_ids(
+            collection, {"mod": 100, "usn": 7}, [111, 222]
+        )
+
+        sql, _args = collection.db.list_queries[-1]
+        self.assertIn("n.mid in (111,222)", sql)
+
+    def test_note_type_touched_without_template_change_is_not_rescanned(self):
+        # AnkiHub rewrites AnKing note types on every startup/sync (bumping
+        # mtime/usn) without changing the templates.
+        collection = _FakeCollection({})
+        collection.template_rows = [(111, 0, b"front"), (222, 0, b"other")]
+        before = self.addon._notetype_template_hashes(collection)
 
         self.assertEqual(
-            self.addon._select_card_ids(collection, {"mod": 1, "usn": 2}), [5]
+            self.addon._changed_notetype_ids({"notetypes": before}, before), []
+        )
+
+        collection.template_rows = [(111, 0, b"front edited"), (222, 0, b"other")]
+        after = self.addon._notetype_template_hashes(collection)
+        self.assertEqual(
+            self.addon._changed_notetype_ids({"notetypes": before}, after), [111]
+        )
+
+    def test_note_type_check_skipped_when_templates_unreadable(self):
+        class NoTemplatesDb(_FakeDb):
+            def all(self, _sql, *_args):
+                raise RuntimeError("no such table: templates")
+
+        collection = _FakeCollection({})
+        collection.db = NoTemplatesDb(collection)
+
+        current = self.addon._notetype_template_hashes(collection)
+        self.assertIsNone(current)
+        self.assertEqual(
+            self.addon._changed_notetype_ids({"notetypes": {}}, current), []
         )
 
     def test_question_hook_does_not_rerender_when_reviewer_html_is_cached(self):

@@ -69,8 +69,11 @@ CLASS_ATTR_PATTERN = re.compile(
 
 def _strip_html(text: str) -> str:
     """Remove HTML tags and decode entities."""
-    text = html_module.unescape(text)
+    # Strip tags BEFORE decoding: attributes such as data-cloze hold escaped
+    # HTML ("&lt;b&gt;answer"), which would otherwise end the tag early and
+    # leak the hidden cloze answer into the spoken text.
     text = re.sub(r"<[^>]*>", "", text)
+    text = html_module.unescape(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 

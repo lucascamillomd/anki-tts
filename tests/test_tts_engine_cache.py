@@ -391,6 +391,30 @@ class TTSEngineCacheTests(unittest.TestCase):
 
             self.assertFalse(result)
 
+    def test_missing_edge_module_pauses_prefetch_instead_of_failing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._edge_tts_checked = True
+            engine._edge_tts = None
+            _TTS_ENGINE_MODULE._edge_import_error = ModuleNotFoundError(
+                "No module named 'edge_tts'", name="edge_tts"
+            )
+            try:
+                self.assertIsNone(engine.prefetch("hello", {"speed": 1.5}))
+                status = engine.edge_status()
+                self.assertTrue(status["open"])
+                self.assertTrue(status["missing"])
+                self.assertIn("edge_tts", status["last_error"])
+                self.assertGreater(engine.prefetch_pause_seconds(), 0)
+            finally:
+                _TTS_ENGINE_MODULE._edge_import_error = None
+
+    def test_edge_status_ok_before_and_after_successful_import(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            self.assertFalse(engine.edge_status()["open"])
+            self.assertEqual(engine.prefetch_pause_seconds(), 0)
+
     def test_prefetch_timeout_does_not_stop_later_cards(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = AudioCache(Path(tmpdir))

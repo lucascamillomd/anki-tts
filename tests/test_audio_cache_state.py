@@ -113,7 +113,8 @@ class AudioCacheStateTests(unittest.TestCase):
                         "entries": {
                             "p": {"key": "p", "status": "pending"},
                             "s": {"key": "s", "status": "succeeded"},
-                            "f": {"key": "f", "status": "failed", "attempts": 1},
+                            "f": {"key": "f", "status": "failed", "attempts": 1,
+                                  "text": "hello"},
                         },
                     }
                 ),
@@ -403,17 +404,28 @@ class RetryFailuresTests(unittest.TestCase):
             self.assertEqual(state.retry_failures_now(), 0)
             self.assertFalse(state.is_dirty())
 
-    def test_has_failures_without_text_detects_legacy_entries(self):
+    def test_legacy_failures_without_text_are_dropped_on_load(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             path.write_text(json.dumps({
                 "version": 1,
-                "entries": {"old": {"status": "failed", "attempts": 1,
-                                    "last_error": "prefetch failed"}},
+                "entries": {
+                    "old": {"status": "failed", "attempts": 1,
+                            "last_error": "prefetch failed",
+                            "next_retry_at": 10**12},
+                    "new": {"status": "failed", "attempts": 1,
+                            "last_error": "timeout", "text": "hello"},
+                },
             }), encoding="utf-8")
             state = AudioCacheState(path, now=Clock(100))
-            self.assertTrue(state.has_failures_without_text())
+            self.assertIsNone(state.entry("old"))
+            self.assertTrue(state.can_retry("old"))
+            self.assertIsNotNone(state.entry("new"))
+            self.assertFalse(state.has_failures_without_text())
+            self.assertTrue(state.is_dirty())
             fresh = AudioCacheState(Path(tmpdir) / "new.json", now=Clock(100))
+            fresh.mark_failed("k", "e", "")
+            self.assertTrue(fresh.has_failures_without_text())
             fresh.mark_failed("k", "e", "text")
             self.assertFalse(fresh.has_failures_without_text())
 
