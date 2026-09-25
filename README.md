@@ -25,11 +25,49 @@ Once installed, the add-on works automatically during reviews. Access settings f
 
 - **Anki TTS → Toggle TTS** (or `Ctrl+Shift+T`) — Enable/disable TTS
 - **Anki TTS → Settings...** — Open the settings dialog
-- **Anki TTS → Warm All Audio Cache** — Pre-generate missing question audio for all cards in the background
-- **Anki TTS → Audio Cache Status** — Count cached vs missing question audio for all speakable cards
-- **Anki TTS → Clear Audio Cache** — Stop background generation and remove cached audio files
+- **Anki TTS → Warm All Audio Cache** — Rescan every card and pre-generate missing question audio in the background
+- **Anki TTS → Audio Cache Status** — Quick tooltip with cached/total, pending and failed counts (from live counters; never rescans the collection)
+- **Anki TTS → Show Monitor** — Open the TTS cache monitor panel (see below)
+- **Anki TTS → Clear Audio Cache** — Asks for confirmation, stops background generation and deletes cached audio files in the background
+- **Speaker icon in the top toolbar** (right of Sync) — Live cache state; click it to show or hide the monitor panel
 
-Cached audio is stored under `anki_tts_addon/user_files/audio_cache/`. Cache job state is stored in `anki_tts_addon/user_files/audio_cache_state.json` so interrupted background work can be resumed after restart. Anki preserves `user_files` across add-on upgrades, so the cache survives reinstalling a newer package. The package itself only ships `user_files/README.txt`; generated MP3/state files are excluded from builds.
+### TTS Cache Monitor
+
+A speaker icon sits in Anki's top toolbar, just right of **Sync**. Its colour shows the background cache state at a glance, and hovering it shows a summary such as `TTS cache 4,780/28,912 (16%) - 120 queued - 312/min - ETA 1h 20m`.
+
+| Icon | Meaning |
+|------|---------|
+| Grey | Idle, nothing to do |
+| Green with a spinning ring and a percentage | Scanning cards or generating audio |
+| Green, no ring | Every speakable card has cached audio |
+| Amber | Paused by you, or some clips failed and are waiting to retry (shown as `!`) |
+| Red `!` | Edge TTS is unreachable and nothing has been generated this session |
+| Faded | TTS, the audio cache or background prefetch is turned off |
+
+Click the icon (or use **Anki TTS → Show Monitor** when the toolbar is hidden, for example during review with some themes) to open a panel on the right side of the main window. It shows:
+
+- a progress bar of cached vs total speakable cards (totals come from the last full scan; after a restart they are marked "from last scan" until the next full scan finishes)
+- pending/active queue size, clips awaiting retry, and scan progress (`full: 12,400/30,120 cards`)
+- the clip being generated right now and how long it has been running
+- generation rate, ETA, and this session's generated/failed counts
+- disk usage against the cache size limit (measured once in the background when the panel first opens, then tracked incrementally)
+- Edge TTS status, including the reason and retry time when the add-on has backed off after repeated network errors
+- how many clips played during review came straight from the cache
+- the last 50 errors with their real cause (for example `request timed out`) and the start of the card text
+
+Buttons:
+
+- **Pause / Resume** — hold background generation after the current clip (for this Anki session only; it is not saved). Quitting Anki is never blocked by a paused worker.
+- **Warm all** — rescan every card and queue missing audio.
+- **Retry failed** — retry failed clips now instead of waiting for their backoff (runs a full card rescan only if old failures from a previous version have no stored text).
+- **Clear cache...** — delete all cached audio after confirmation; files are removed in the background.
+- **Open cache folder** / **Open log** — open `user_files/audio_cache/` or the folder with `user_files/anki_tts.log`.
+
+The panel refreshes at most twice a second while it is open or work is running, and every 3 seconds otherwise. Each refresh only reads in-memory counters: no disk scans, no config reads and no collection access, so the monitor itself cannot slow Anki down. The background worker never calls into the UI.
+
+The add-on also writes a rotating log (`user_files/anki_tts.log`, up to 1 MB plus 2 backups) with warnings and errors from Edge TTS, the background worker and card scans. Attach it when reporting a problem.
+
+Cached audio is stored under `anki_tts_addon/user_files/audio_cache/`. Failed clips (with their retry backoff) and the last scan position are stored in `anki_tts_addon/user_files/audio_cache_state.json`, written at most every few seconds from a background thread. Anki preserves `user_files` across add-on upgrades, so the cache survives reinstalling a newer package. The package itself only ships `user_files/README.txt`; generated MP3/state files are excluded from builds.
 
 ### Settings
 
@@ -61,9 +99,9 @@ Anki TTS caches generated Edge TTS MP3 files under the add-on's `user_files/audi
 
 During review, the add-on plays cached audio immediately when available. If audio is missing, it generates the file with Edge TTS, stores it, and then plays it. The **Anki TTS -> Warm All Audio Cache** menu action queues every card for background generation. Existing cache files are skipped, so this is mainly work for new or changed card text. When a warm-all pass drains, the add-on reports whether the cache is complete or how many cards are still missing audio.
 
-If Anki quits before background caching finishes, pending cache work remains in the state file and is reconsidered on the next startup or sync. Stale partial `.tmp` audio files are removed on profile open. Transient Edge failures are marked failed with retry backoff, so repeated startup/sync scans do not immediately hammer the service.
+If Anki quits before background caching finishes, the next startup rescans the cards that were not finished. Stale partial `.tmp` audio files are removed on profile open. Transient Edge failures are marked failed with retry backoff, so repeated startup/sync scans do not immediately hammer the service.
 
-If card text, voice, or speed changes, the cache key changes and new audio is generated automatically. The same all-card warm pass runs silently on profile open and after collection sync, but startup warming waits briefly and then scans cards in small UI-thread batches to avoid freezing Anki. Use **Anki TTS -> Audio Cache Status** to check `cached/total` progress plus pending/failed counts at any time. Old files can be removed with **Anki TTS -> Clear Audio Cache**.
+If card text, voice, or speed changes, the cache key changes and new audio is generated automatically. The same all-card warm pass runs silently on profile open and after collection sync, but startup warming waits briefly, scans off the UI thread in small batches (so reviewing, the browser and sync never wait behind it), and only looks at cards changed since the last completed pass (including cards whose note type template was edited). Use the toolbar icon or **Anki TTS -> Show Monitor** to watch progress at any time. Old files can be removed with **Anki TTS -> Clear Audio Cache**.
 
 ## Building from Source
 
@@ -90,7 +128,10 @@ anki_tts_addon/
   manifest.json        # Anki add-on metadata
   audio_cache.py       # Persistent generated-audio cache
   audio_cache_state.py # Persistent cache job/failure metadata
-  audio_prefetch.py    # Background cache warmer
+  audio_prefetch.py    # Background cache warmer (pause/resume, status)
+  monitor_model.py     # Pure monitor data model: stats, snapshot, formatting, toolbar HTML/JS
+  monitor_ui.py        # Toolbar icon, refresh timer and monitor dock (Qt, main thread only)
+  addon_log.py         # Rotating log file in user_files/anki_tts.log
   card_text.py         # Shared card text extraction for live and cached audio
   user_files/          # Preserved local files; generated audio cache lives here
   vendor/              # Bundled Python dependencies

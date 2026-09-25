@@ -271,7 +271,7 @@ class AudioPrefetcherTests(unittest.TestCase):
             engine.release.set()
             prefetcher.stop()
 
-    def test_enqueue_recovers_after_timed_stop_worker_exits(self):
+    def test_enqueue_does_not_revive_stopped_worker_without_start(self):
         engine = BlockingEngine()
         prefetcher = AudioPrefetcher(engine)
 
@@ -290,8 +290,15 @@ class AudioPrefetcherTests(unittest.TestCase):
             ):
                 time.sleep(0.01)
 
+            # Without a live thread nothing would ever process the item.
+            self.assertFalse(prefetcher.enqueue("after", {"speed": 1.5}))
+            self.assertEqual(prefetcher.status()["pending"], 0)
+
+            self.assertTrue(prefetcher.start())
             self.assertTrue(prefetcher.enqueue("after", {"speed": 1.5}))
-            prefetcher.drain_for_tests()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and len(engine.calls) < 2:
+                time.sleep(0.01)
 
             self.assertEqual(
                 engine.calls,
@@ -524,6 +531,245 @@ class AudioPrefetcherTests(unittest.TestCase):
             results,
             [("canceled", 1.5, None, None)],
         )
+
+
+    def test_result_callback_exception_does_not_kill_worker(self):
+        engine = FakeEngine()
+        prefetcher = AudioPrefetcher(engine)
+        self.addCleanup(prefetcher.stop)
+
+        def bad_callback(text, config, ok, error):
+            raise OSError("disk full")
+
+        prefetcher.set_result_callback(bad_callback)
+        with self.assertLogs(_MODULE.log, level="ERROR"):
+            prefetcher.start()
+            prefetcher.enqueue("first", {"speed": 1.5})
+            prefetcher.enqueue("second", {"speed": 1.5})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and len(engine.calls) < 2:
+                time.sleep(0.01)
+
+        self.assertEqual(len(engine.calls), 2)
+        self.assertTrue(prefetcher._thread.is_alive())
+
+    def test_idle_callback_exception_does_not_kill_worker(self):
+        engine = FakeEngine()
+        prefetcher = AudioPrefetcher(engine)
+        self.addCleanup(prefetcher.stop)
+
+        def bad_idle():
+            raise RuntimeError("run_on_main during teardown")
+
+        prefetcher.set_idle_callback(bad_idle)
+        with self.assertLogs(_MODULE.log, level="ERROR"):
+            prefetcher.start()
+            prefetcher.enqueue("first", {"speed": 1.5})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not engine.calls:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            prefetcher.enqueue("second", {"speed": 1.5})
+            while time.monotonic() < deadline and len(engine.calls) < 2:
+                time.sleep(0.01)
+
+        self.assertEqual(len(engine.calls), 2)
+        self.assertTrue(prefetcher._thread.is_alive())
+
+    def test_stop_cancels_inflight_engine_request(self):
+        class CancellableEngine(BlockingEngine):
+            def __init__(self):
+                super().__init__()
+                self.cancel_calls = 0
+
+            def cancel_prefetch(self):
+                self.cancel_calls += 1
+                self.release.set()
+
+        engine = CancellableEngine()
+        prefetcher = AudioPrefetcher(engine)
+        prefetcher.start()
+        prefetcher.enqueue("active", {"speed": 1.5})
+        self.assertTrue(engine.entered.wait(timeout=2))
+
+        started = time.monotonic()
+        self.assertTrue(prefetcher.stop(timeout=1))
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(engine.cancel_calls, 1)
+
+    def test_worker_pauses_queue_while_engine_reports_pause(self):
+        class PausingEngine(FakeEngine):
+            def __init__(self):
+                super().__init__()
+                self.pause = 5.0
+
+            def prefetch_pause_seconds(self):
+                return self.pause
+
+        engine = PausingEngine()
+        prefetcher = AudioPrefetcher(engine)
+        prefetcher.PAUSE_POLL_SECONDS = 0.01
+        self.addCleanup(prefetcher.stop)
+
+        with self.assertLogs(_MODULE.log, level="WARNING") as logs:
+            prefetcher.start()
+            prefetcher.enqueue("waiting", {"speed": 1.5})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not prefetcher.status()["paused"]:
+                time.sleep(0.01)
+            time.sleep(0.05)
+
+            self.assertTrue(prefetcher.status()["paused"])
+            self.assertEqual(engine.calls, [])
+            engine.pause = 0
+            while time.monotonic() < deadline and not engine.calls:
+                time.sleep(0.01)
+
+        self.assertEqual(engine.calls, [("waiting", {"speed": 1.5})])
+        self.assertFalse(prefetcher.status()["paused"])
+        self.assertEqual(len(logs.output), 1)
+
+    def test_stop_while_paused_returns_promptly(self):
+        class PausedEngine(FakeEngine):
+            def prefetch_pause_seconds(self):
+                return 60
+
+        engine = PausedEngine()
+        prefetcher = AudioPrefetcher(engine)
+        with self.assertLogs(_MODULE.log, level="WARNING"):
+            prefetcher.start()
+            prefetcher.enqueue("waiting", {"speed": 1.5})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not prefetcher.status()["paused"]:
+                time.sleep(0.01)
+
+            started = time.monotonic()
+            self.assertTrue(prefetcher.stop(timeout=1))
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(engine.calls, [])
+
+    def test_status_reports_counts_and_last_error(self):
+        engine = ReportingEngine()
+        prefetcher = AudioPrefetcher(engine)
+
+        prefetcher.enqueue("ok", {"speed": 1.5})
+        prefetcher.enqueue("fail", {"speed": 1.5})
+        prefetcher.drain_for_tests()
+
+        status = prefetcher.status()
+        self.assertEqual(status["succeeded"], 1)
+        self.assertEqual(status["failed"], 1)
+        self.assertEqual(status["last_error"], "prefetch failed")
+        self.assertIsNone(status["current"])
+        self.assertFalse(status["paused"])
+
+    def test_user_pause_holds_queue_and_resume_drains_it(self):
+        engine = FakeEngine()
+        prefetcher = AudioPrefetcher(engine)
+        prefetcher.USER_PAUSE_POLL_SECONDS = 0.01
+        self.addCleanup(prefetcher.stop, 1)
+        prefetcher.pause()
+        self.assertTrue(prefetcher.is_paused())
+        prefetcher.start()
+        prefetcher.enqueue("a", {"speed": 1.5})
+        prefetcher.enqueue("b", {"speed": 1.5})
+        time.sleep(0.1)
+        self.assertEqual(engine.calls, [])
+        status = prefetcher.status()
+        self.assertTrue(status["paused"])
+        self.assertTrue(status["user_paused"])
+        self.assertFalse(status["edge_waiting"])
+        self.assertEqual(status["pending"], 2)
+
+        prefetcher.resume()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(engine.calls) < 2:
+            time.sleep(0.01)
+        self.assertEqual([c[0] for c in engine.calls], ["a", "b"])
+        self.assertFalse(prefetcher.status()["paused"])
+
+    def test_pause_lets_current_item_finish(self):
+        engine = BlockingEngine()
+        prefetcher = AudioPrefetcher(engine)
+        self.addCleanup(prefetcher.stop, 1)
+        prefetcher.start()
+        prefetcher.enqueue("first", {"speed": 1.5})
+        prefetcher.enqueue("second", {"speed": 1.5})
+        self.assertTrue(engine.entered.wait(timeout=2))
+        prefetcher.pause()
+        engine.release.set()
+        time.sleep(0.2)
+        self.assertEqual([c[0] for c in engine.calls], ["first"])
+
+    def test_stop_while_user_paused_returns_quickly(self):
+        # Quit-hang regression: a paused worker must never block close.
+        engine = FakeEngine()
+        prefetcher = AudioPrefetcher(engine)
+        prefetcher.USER_PAUSE_POLL_SECONDS = 5  # prove stop() wakes the wait
+        prefetcher.pause()
+        prefetcher.start()
+        prefetcher.enqueue("held", {"speed": 1.5})
+        time.sleep(0.05)
+        started = time.monotonic()
+        self.assertTrue(prefetcher.stop(timeout=1))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(engine.calls, [])
+
+    def test_restart_keeps_user_pause(self):
+        engine = FakeEngine()
+        prefetcher = AudioPrefetcher(engine)
+        prefetcher.USER_PAUSE_POLL_SECONDS = 0.01
+        prefetcher.pause()
+        prefetcher.start()
+        self.assertTrue(prefetcher.stop(timeout=1))
+        prefetcher.start()
+        self.addCleanup(prefetcher.stop, 1)
+        prefetcher.enqueue("x", {"speed": 1.5})
+        time.sleep(0.1)
+        self.assertEqual(engine.calls, [])
+        prefetcher.resume()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not engine.calls:
+            time.sleep(0.01)
+        self.assertEqual(len(engine.calls), 1)
+
+    def test_status_reports_current_item_start_time(self):
+        engine = BlockingEngine()
+        prefetcher = AudioPrefetcher(engine)
+        self.addCleanup(prefetcher.stop, 1)
+        prefetcher.start()
+        before = time.monotonic()
+        prefetcher.enqueue("slow   card\ntext", {"speed": 1.5})
+        self.assertTrue(engine.entered.wait(timeout=2))
+        status = prefetcher.status()
+        self.assertEqual(status["current"], "slow card text")
+        self.assertGreaterEqual(status["current_started_at"], before)
+        engine.release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and prefetcher.status()["current"]:
+            time.sleep(0.01)
+        self.assertIsNone(prefetcher.status()["current_started_at"])
+
+    def test_failure_uses_engine_reason_instead_of_generic_message(self):
+        class ReasonEngine(FakeEngine):
+            def prefetch(self, text, config):
+                self.calls.append((text, dict(config)))
+                return False
+
+            def last_prefetch_error(self):
+                return "request timed out"
+
+        results = []
+        prefetcher = AudioPrefetcher(ReasonEngine())
+        prefetcher.set_result_callback(
+            lambda text, config, ok, error: results.append((ok, error))
+        )
+        prefetcher.enqueue("x", {"speed": 1.5})
+        prefetcher.drain_for_tests()
+        self.assertEqual(results, [(False, "request timed out")])
+        self.assertEqual(prefetcher.status()["last_error"], "request timed out")
 
 
 if __name__ == "__main__":

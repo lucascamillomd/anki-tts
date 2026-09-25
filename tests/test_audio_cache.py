@@ -19,6 +19,38 @@ def _valid_audio_bytes(fill=b"m"):
 
 
 class AudioCacheTests(unittest.TestCase):
+    def test_known_total_bytes_never_scans(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = AudioCache(Path(tmpdir))
+            (Path(tmpdir) / "a.mp3").write_bytes(_valid_audio_bytes())
+            original = os.scandir
+
+            def fail(*_a, **_k):
+                raise AssertionError("scandir called")
+
+            _MODULE.os.scandir = fail
+            try:
+                self.assertIsNone(cache.known_total_bytes())
+            finally:
+                _MODULE.os.scandir = original
+            self.assertEqual(cache.total_bytes(), MIN_AUDIO_BYTES)
+            self.assertEqual(cache.known_total_bytes(), MIN_AUDIO_BYTES)
+
+    def test_remove_all_audio_files_keeps_other_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            for name in ("a.mp3", "b.mp3"):
+                (root / name).write_bytes(_valid_audio_bytes())
+            (root / "keep.txt").write_text("x")
+            cache.total_bytes()
+
+            self.assertEqual(cache.remove_all_audio_files(), 2)
+
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["keep.txt"])
+            self.assertIsNone(cache.known_total_bytes())
+            self.assertEqual(cache.total_bytes(), 0)
+
     def test_key_changes_when_text_voice_or_speed_changes(self):
         key = speech_cache_key("hello", "en-GB-RyanNeural", 1.25)
 
@@ -158,6 +190,26 @@ class AudioCacheTests(unittest.TestCase):
             self.assertTrue(audio_file.exists())
             self.assertTrue(directory.exists())
 
+    def test_cleanup_temp_files_keeps_recent_files_when_min_age_given(self):
+        import os
+        import time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            old_tmp = root / "old.tmp"
+            fresh_tmp = root / "fresh.tmp"
+            old_tmp.write_bytes(b"partial")
+            fresh_tmp.write_bytes(b"in progress")
+            old = time.time() - 3600
+            os.utime(old_tmp, (old, old))
+
+            removed = cache.cleanup_temp_files(min_age_seconds=300)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old_tmp.exists())
+            self.assertTrue(fresh_tmp.exists())
+
     def test_cleanup_removes_oldest_mp3_files_until_under_limit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -179,6 +231,67 @@ class AudioCacheTests(unittest.TestCase):
             self.assertFalse(middle.exists())
             self.assertTrue(newest.exists())
             self.assertTrue(ignored.exists())
+
+    def test_cached_keys_lists_mp3_stems_from_one_scan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            (root / "a.mp3").write_bytes(_valid_audio_bytes())
+            (root / "b.mp3").write_bytes(_valid_audio_bytes())
+            (root / "c.tmp").write_bytes(_valid_audio_bytes())
+            (root / "d.mp3").mkdir()
+
+            self.assertEqual(cache.cached_keys(), {"a", "b"})
+
+    def test_total_bytes_is_tracked_incrementally_on_store_and_remove(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            (root / "existing.mp3").write_bytes(b"x" * MIN_AUDIO_BYTES)
+            self.assertEqual(cache.total_bytes(), MIN_AUDIO_BYTES)
+
+            tmp = cache.temp_path_for_key("new")
+            tmp.write_bytes(b"y" * (MIN_AUDIO_BYTES * 2))
+            cache.store_from_temp("new", tmp)
+            original_scandir = os.scandir
+
+            def fail_scandir(*_args, **_kwargs):
+                raise AssertionError("total_bytes must not rescan")
+
+            try:
+                os.scandir = fail_scandir
+                self.assertEqual(cache.total_bytes(), MIN_AUDIO_BYTES * 3)
+                cache.remove("existing")
+                self.assertEqual(cache.total_bytes(), MIN_AUDIO_BYTES * 2)
+            finally:
+                os.scandir = original_scandir
+
+    def test_cleanup_if_needed_skips_scan_under_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            (root / "a.mp3").write_bytes(b"x" * MIN_AUDIO_BYTES)
+            cache.total_bytes()
+            calls = []
+            cache.cleanup = lambda max_bytes: calls.append(max_bytes)
+
+            cache.cleanup_if_needed(MIN_AUDIO_BYTES * 2)
+            self.assertEqual(calls, [])
+
+            cache.cleanup_if_needed(MIN_AUDIO_BYTES - 1, target_bytes=10)
+            self.assertEqual(calls, [10])
+
+    def test_cleanup_updates_tracked_total(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            for name in ("a", "b", "c"):
+                (root / f"{name}.mp3").write_bytes(b"x" * MIN_AUDIO_BYTES)
+
+            cache.cleanup(MIN_AUDIO_BYTES)
+
+            self.assertEqual(cache.total_bytes(), MIN_AUDIO_BYTES)
+            self.assertEqual(len(cache.cached_keys()), 1)
 
     def test_generation_lock_is_reused_per_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:

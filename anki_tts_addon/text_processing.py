@@ -53,6 +53,15 @@ RAW_CLOZE_CAPTURE_PATTERN = re.compile(
 _TAG_TOKEN_PATTERN = re.compile(
     r"<(/?)([a-zA-Z0-9]+)([^>]*?)(/?)>", re.DOTALL
 )
+# Audio/TTS references. Warm-up renders question_text with [anki:play:q:N]
+# placeholders; the live reviewer HTML has them replaced by replay-button
+# anchors. Both are stripped so the two paths share one cache key.
+AV_TAG_PATTERN = re.compile(
+    r"\[(?:anki:play:[^\]]*|sound:[^\]]*)\]", re.IGNORECASE
+)
+REPLAY_BUTTON_PATTERN = re.compile(
+    r"<a\b[^>]*\breplay-button\b[^>]*>.*?</a>", re.DOTALL | re.IGNORECASE
+)
 CLASS_ATTR_PATTERN = re.compile(
     r"\bclass\s*=\s*([\"'])(.*?)\1", re.DOTALL | re.IGNORECASE
 )
@@ -207,6 +216,9 @@ def extract_speakable_text(
         )
         if match:
             content = content[match.end():]
+
+    content = REPLAY_BUTTON_PATTERN.sub(" ", content)
+    content = AV_TAG_PATTERN.sub(" ", content)
 
     # Try to extract from a #text div (common card template pattern)
     text_match = re.search(

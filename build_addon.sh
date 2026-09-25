@@ -25,6 +25,8 @@ zip -r "../$OUTPUT" . \
     -x "user_files/*.mp3" \
     -x "user_files/*.json" \
     -x "user_files/*.tmp" \
+    -x "user_files/*.log" \
+    -x "user_files/*.log.*" \
     -x "CLAUDE.md" \
     -x "*/CLAUDE.md" \
     -x ".DS_Store" \

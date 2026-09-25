@@ -5,36 +5,23 @@ import types
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-_AQT_MODULES = ("aqt", "aqt.qt", "aqt.utils")
-_MISSING = object()
-_DEFAULT_CONFIG = {
-    "enabled": True,
-    "speak_question": True,
-    "speak_answer": True,
-    "fallback_to_system": True,
-    "speed": 1.5,
-    "cache_enabled": True,
-    "prefetch_enabled": True,
-    "cache_max_mb": 2048,
-}
+
+from fake_aqt import (  # noqa: E402
+    _AQT_MODULES,
+    _DEFAULT_CONFIG,
+    _MISSING,
+    _FakeAddonManager,
+    _ImmediateFuture,
+    _install_fake_aqt,
+)
 
 
 def _purge_addon_modules():
     for name in list(sys.modules):
         if name == "anki_tts_addon" or name.startswith("anki_tts_addon."):
             del sys.modules[name]
-
-
-class _FakeAddonManager:
-    def __init__(self):
-        self.config = dict(_DEFAULT_CONFIG)
-
-    def getConfig(self, _name):
-        return dict(self.config)
-
-    def writeConfig(self, _name, conf):
-        self.config = dict(conf)
 
 
 class _FakeEngine:
@@ -122,11 +109,29 @@ class _FakeSpinBox:
         return self._value
 
 
+class _FakeDb:
+    def __init__(self, collection):
+        self.collection = collection
+        self.list_queries = []
+        self.usn = 0
+
+    def list(self, sql, *args):
+        self.list_queries.append((sql, args))
+        return list(self.collection.changed_ids)
+
+    def scalar(self, _sql, *_args):
+        return self.usn
+
+
 class _FakeCollection:
+    path = "/fake/collection.anki2"
+
     def __init__(self, cards):
         self.cards = dict(cards)
         self.find_queries = []
         self.get_card_ids = []
+        self.changed_ids = []
+        self.db = _FakeDb(self)
 
     def find_cards(self, query):
         self.find_queries.append(query)
@@ -184,91 +189,6 @@ class _FakeCard:
         )
 
 
-def _install_fake_aqt():
-    hooks = types.SimpleNamespace(
-        card_will_show=[],
-        reviewer_did_show_question=[],
-        reviewer_did_show_answer=[],
-        reviewer_will_end=[],
-        profile_did_open=[],
-        profile_will_close=[],
-        sync_did_finish=[],
-        menus=[],
-        tooltips=[],
-        timers=[],
-    )
-
-    def add_menu(menu):
-        hooks.menus.append(menu)
-
-    aqt_module = types.ModuleType("aqt")
-    aqt_module.gui_hooks = hooks
-    aqt_module.mw = types.SimpleNamespace(
-        addonManager=_FakeAddonManager(),
-        taskman=types.SimpleNamespace(run_on_main=lambda fn: fn()),
-        col=None,
-        form=types.SimpleNamespace(
-            menubar=types.SimpleNamespace(addMenu=add_menu)
-        ),
-    )
-
-    qt_module = types.ModuleType("aqt.qt")
-
-    class _FakeSignal:
-        def __init__(self):
-            self.callbacks = []
-
-        def connect(self, callback):
-            self.callbacks.append(callback)
-
-    class _FakeAction:
-        def __init__(self, *args, **_kwargs):
-            self.text = args[0] if args else ""
-            self.triggered = _FakeSignal()
-            self.shortcut = None
-
-        def setShortcut(self, shortcut):
-            self.shortcut = shortcut
-
-    class _FakeMenu:
-        def __init__(self, *args, **_kwargs):
-            self.title = args[0] if args else ""
-            self.actions = []
-
-        def addAction(self, action):
-            self.actions.append(action)
-
-    class _FakeTimer:
-        @staticmethod
-        def singleShot(delay_ms, callback):
-            hooks.timers.append((delay_ms, callback))
-
-    class _FakeWidget:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-    qt_module.QAction = _FakeAction
-    qt_module.QMenu = _FakeMenu
-    qt_module.QDialog = _FakeWidget
-    qt_module.QVBoxLayout = _FakeWidget
-    qt_module.QHBoxLayout = _FakeWidget
-    qt_module.QLabel = _FakeWidget
-    qt_module.QDoubleSpinBox = _FakeWidget
-    qt_module.QCheckBox = _FakeWidget
-    qt_module.QPushButton = _FakeWidget
-    qt_module.QGroupBox = _FakeWidget
-    qt_module.QTimer = _FakeTimer
-
-    utils_module = types.ModuleType("aqt.utils")
-    utils_module.tooltip = lambda msg: hooks.tooltips.append(msg)
-
-    sys.modules["aqt"] = aqt_module
-    sys.modules["aqt.qt"] = qt_module
-    sys.modules["aqt.utils"] = utils_module
-
-    return hooks
-
-
 class ReviewerHookTests(unittest.TestCase):
     def setUp(self):
         self._saved_modules = {
@@ -277,9 +197,20 @@ class ReviewerHookTests(unittest.TestCase):
         _purge_addon_modules()
         self.hooks = _install_fake_aqt()
         self.addon = importlib.import_module("anki_tts_addon")
+        # Never touch the real add-on user_files from tests.
+        self._user_files = tempfile.TemporaryDirectory()
+        self.addCleanup(self._user_files.cleanup)
+        user_files = Path(self._user_files.name)
+        self.addon._addon_user_files_dir = lambda: user_files
 
     def tearDown(self):
         _purge_addon_modules()
+        import logging
+
+        for handler in list(logging.getLogger("anki_tts_addon").handlers):
+            if getattr(handler, "_anki_tts_file_handler", False):
+                logging.getLogger("anki_tts_addon").removeHandler(handler)
+                handler.close()
         for name in _AQT_MODULES:
             sys.modules.pop(name, None)
             saved = self._saved_modules[name]
@@ -296,6 +227,10 @@ class ReviewerHookTests(unittest.TestCase):
     def _run_all_timers(self):
         while self.hooks.timers:
             self._run_next_timer()
+
+    def _delayed_timers(self):
+        """QTimer.singleShot timers (delay > 0), not queued background tasks."""
+        return [timer for timer in self.hooks.timers if timer[0] > 0]
 
     def test_profile_open_registers_rendered_html_cache_hook(self):
         self.addon._menu_added = True
@@ -329,12 +264,18 @@ class ReviewerHookTests(unittest.TestCase):
                 "Settings...",
                 "Warm All Audio Cache",
                 "Audio Cache Status",
+                "Show Monitor",
                 "Clear Audio Cache",
             ],
         )
         warm_action = actions[action_texts.index("Warm All Audio Cache")]
         status_action = actions[action_texts.index("Audio Cache Status")]
+        monitor_action = actions[action_texts.index("Show Monitor")]
         clear_action = actions[action_texts.index("Clear Audio Cache")]
+        self.assertEqual(
+            monitor_action.triggered.callbacks,
+            [self.addon.show_monitor],
+        )
         self.assertEqual(
             warm_action.triggered.callbacks,
             [self.addon.warm_all_audio_cache],
@@ -345,7 +286,7 @@ class ReviewerHookTests(unittest.TestCase):
         )
         self.assertEqual(
             clear_action.triggered.callbacks,
-            [self.addon.clear_audio_cache],
+            [self.addon.confirm_clear_audio_cache],
         )
 
     def test_profile_open_registers_sync_hook_when_available(self):
@@ -356,13 +297,19 @@ class ReviewerHookTests(unittest.TestCase):
         self.addon._on_profile_did_open()
 
         self.assertIn(self.addon.on_sync_did_finish, self.hooks.sync_did_finish)
+        self.assertIn(self.addon.on_sync_will_start, self.hooks.sync_will_start)
+
+        self.addon._on_profile_will_close()
+
+        self.assertEqual(self.hooks.sync_did_finish, [])
+        self.assertEqual(self.hooks.sync_will_start, [])
 
     def test_profile_open_cleans_stale_audio_temp_files_before_warming(self):
         events = []
 
         class RecordingCache:
-            def cleanup_temp_files(self):
-                events.append("cleanup")
+            def cleanup_temp_files(self, min_age_seconds=0):
+                events.append(("cleanup", min_age_seconds))
                 return 2
 
         class RecordingCollection(_FakeCollection):
@@ -378,11 +325,20 @@ class ReviewerHookTests(unittest.TestCase):
 
         self.addon._on_profile_did_open()
 
-        self.assertEqual(events, ["cleanup"])
+        # The directory scan runs off the main thread, and only removes
+        # leftovers old enough not to belong to a clip being generated now.
+        self.assertEqual(events, [])
+        self.assertEqual(
+            self.hooks.background_calls[0]["kwargs"], {"uses_collection": False}
+        )
 
-        self.hooks.timers.pop(0)[1]()
+        with self.assertLogs(self.addon.log, level="WARNING"):
+            self._run_all_timers()
 
-        self.assertEqual(events, ["cleanup", "warm"])
+        self.assertEqual(
+            events,
+            [("cleanup", self.addon.TEMP_FILE_MIN_AGE_SECONDS), "warm"],
+        )
 
     def test_profile_open_does_not_start_prefetcher_when_tts_disabled(self):
         self.addon._menu_added = True
@@ -428,44 +384,110 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertTrue(prefetcher.stopped)
         self.assertEqual(
             prefetcher.stop_timeouts,
-            [self.addon.PREFETCH_STOP_TIMEOUT_SECONDS],
+            [self.addon.CLOSE_STOP_TIMEOUT_SECONDS],
         )
         self.assertIsNone(self.addon._prefetcher)
         self.assertEqual(engine.stop_count, 1)
         self.assertEqual(
             engine.wait_timeouts,
-            [self.addon.PREFETCH_STOP_TIMEOUT_SECONDS],
+            [self.addon.CLOSE_STOP_TIMEOUT_SECONDS],
         )
         self.assertIsNone(self.addon._engine)
 
-    def test_profile_close_preserves_state_when_prefetcher_stop_times_out(self):
+    def test_profile_close_cancels_and_shuts_down_engine_with_short_waits(self):
+        events = []
+
+        class ShutdownEngine(_FakeEngine):
+            def cancel_prefetch(self):
+                events.append("cancel_prefetch")
+
+            def shutdown(self, timeout=None):
+                events.append(("shutdown", timeout))
+                return True
+
+        class RecordingPrefetcher(_FakePrefetcher):
+            def stop(self, timeout=None):
+                events.append(("prefetcher.stop", timeout))
+                return super().stop(timeout)
+
+        self.addon._engine = ShutdownEngine()
+        self.addon._prefetcher = RecordingPrefetcher()
+
+        self.addon._on_profile_will_close()
+
+        timeout = self.addon.CLOSE_STOP_TIMEOUT_SECONDS
+        self.assertLessEqual(timeout, 0.3)
+        self.assertEqual(
+            events,
+            [
+                "cancel_prefetch",
+                ("prefetcher.stop", timeout),
+                ("shutdown", timeout),
+            ],
+        )
+
+    def test_profile_close_flushes_state_and_drops_pending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            state = self._new_cache_state(path)
+            state.mark_failed("failed", "boom", "text")
+            state.mark_pending("pending", "pending text")
+            self.addon._audio_cache_state = state
+
+            self.addon._on_profile_will_close()
+
+            reloaded = self._new_cache_state(path)
+            self.assertEqual(reloaded.summary(), {"pending": 0, "failed": 1})
+            self.assertIsNone(self.addon._audio_cache_state)
+
+    def test_profile_close_detaches_status_callback(self):
+        tts_engine_module = importlib.import_module("anki_tts_addon.tts_engine")
+        self.addon._menu_added = True
+        self.addon._hooks_registered = False
+        self.addon._prefetcher = _FakePrefetcher()
+        self.addon._on_profile_did_open()
+        self.assertIsNotNone(tts_engine_module._status_callback)
+        shown = []
+        self.addon.mw.taskman.run_on_main = lambda fn: shown.append(fn)
+
+        self.addon._on_profile_will_close()
+        self.addon._show_status("late message from a worker")
+
+        self.assertIsNone(tts_engine_module._status_callback)
+        self.assertEqual(shown, [])
+
+    def test_profile_close_detaches_worker_when_prefetcher_stop_times_out(self):
         prefetcher = _FakePrefetcher(stop_result=False)
         engine = _FakeEngine()
-        audio_cache = object()
         self.addon._prefetcher = prefetcher
         self.addon._engine = engine
-        self.addon._audio_cache = audio_cache
+        self.addon._audio_cache = object()
         self.addon._engine_cache_enabled = True
+        prefetcher.idle_callback = self.addon._on_audio_prefetch_idle
+        prefetcher.result_callback = self.addon._on_audio_prefetch_result
 
         self.addon._on_profile_will_close()
 
         self.assertEqual(
             prefetcher.stop_timeouts,
-            [self.addon.PREFETCH_STOP_TIMEOUT_SECONDS],
+            [self.addon.CLOSE_STOP_TIMEOUT_SECONDS],
         )
-        self.assertIs(self.addon._prefetcher, prefetcher)
+        # The stuck worker can no longer call back into the add-on, and the
+        # next profile gets a fresh one instead of the half-stopped worker.
+        self.assertIsNone(prefetcher.idle_callback)
+        self.assertIsNone(prefetcher.result_callback)
+        self.assertIsNone(self.addon._prefetcher)
         self.assertEqual(engine.stop_count, 1)
-        self.assertIs(self.addon._engine, engine)
-        self.assertIs(self.addon._audio_cache, audio_cache)
-        self.assertTrue(self.addon._engine_cache_enabled)
+        self.assertIsNone(self.addon._engine)
+        self.assertIsNone(self.addon._audio_cache)
+        self.assertIsNone(self.addon._engine_cache_enabled)
 
-    def test_profile_close_preserves_state_when_live_speech_stop_times_out(self):
+    def test_profile_close_does_not_wait_long_for_live_speech(self):
         prefetcher = _FakePrefetcher()
         engine = _FakeEngine(wait_result=False)
-        audio_cache = object()
         self.addon._prefetcher = prefetcher
         self.addon._engine = engine
-        self.addon._audio_cache = audio_cache
+        self.addon._audio_cache = object()
         self.addon._engine_cache_enabled = True
 
         self.addon._on_profile_will_close()
@@ -474,11 +496,9 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(engine.stop_count, 1)
         self.assertEqual(
             engine.wait_timeouts,
-            [self.addon.PREFETCH_STOP_TIMEOUT_SECONDS],
+            [self.addon.CLOSE_STOP_TIMEOUT_SECONDS],
         )
-        self.assertIs(self.addon._engine, engine)
-        self.assertIs(self.addon._audio_cache, audio_cache)
-        self.assertTrue(self.addon._engine_cache_enabled)
+        self.assertIsNone(self.addon._engine)
 
     def test_profile_close_invalidates_pending_manual_warm_timer(self):
         old_collection = _FakeCollection({1: _FakeDueCard(1, "old")})
@@ -498,21 +518,21 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(new_collection.find_queries, [])
         self.assertEqual(prefetcher.enqueued, [])
 
-    def test_profile_close_invalidates_pending_status_timer(self):
-        old_collection = _FakeCollection({1: _FakeDueCard(1, "old")})
-        new_collection = _FakeCollection({2: _FakeDueCard(2, "new")})
-        self.addon.mw.col = old_collection
+    def test_audio_cache_status_never_scans_the_collection(self):
+        collection = _FakeCollection({1: _FakeDueCard(1, "card")})
+        self.addon.mw.col = collection
 
         self.addon.show_audio_cache_status()
-        self.addon._on_profile_will_close()
-        self.addon.mw.col = new_collection
-        self._run_all_timers()
 
-        self.assertEqual(old_collection.find_queries, [])
-        self.assertEqual(new_collection.find_queries, [])
+        self.assertEqual(collection.find_queries, [])
+        self.assertEqual(collection.get_card_ids, [])
+        self.assertEqual(self.hooks.timers, [])
         self.assertEqual(
             self.hooks.tooltips,
-            ["Checking TTS audio cache status..."],
+            [
+                "Audio cache: no full scan yet (use Warm All Audio Cache); "
+                "worker idle"
+            ],
         )
 
     def test_profile_close_invalidates_scheduled_auto_warm_timer(self):
@@ -551,7 +571,7 @@ class ReviewerHookTests(unittest.TestCase):
         self.addon.mw.col = new_collection
         self.addon._on_profile_did_open()
 
-        self.assertEqual(len(self.hooks.timers), 2)
+        self.assertEqual(len(self._delayed_timers()), 2)
 
         self._run_next_timer()
 
@@ -559,7 +579,7 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(new_collection.find_queries, [])
         self.assertEqual(prefetcher.enqueued, [])
 
-        self._run_next_timer()
+        self._run_all_timers()
 
         self.assertEqual(old_collection.find_queries, [])
         self.assertEqual(new_collection.find_queries, [""])
@@ -942,80 +962,69 @@ class ReviewerHookTests(unittest.TestCase):
             "Queued 1 cards for TTS audio caching",
         )
 
-    def test_warm_all_audio_cache_batches_card_rendering_across_timer_ticks(self):
+    def test_warm_scan_runs_as_one_background_op_not_ui_timer_batches(self):
         collection = _FakeCollection(
-            {
-                1: _FakeDueCard(1, "first"),
-                2: _FakeDueCard(2, "second"),
-            }
+            {card_id: _FakeDueCard(card_id, f"card {card_id}") for card_id in range(1, 51)}
         )
         self.addon.mw.col = collection
-        self.addon.MANUAL_WARM_BATCH_SIZE = 1
         prefetcher = _FakePrefetcher()
         self.addon._engine = _FakeEngine()
         self.addon._prefetcher = None
         self.addon.AudioPrefetcher = lambda _engine: prefetcher
 
         self.addon.warm_all_audio_cache()
-        self._run_next_timer()
 
-        self.assertEqual(collection.get_card_ids, [1])
-        self.assertEqual(prefetcher.enqueued, [("first", _DEFAULT_CONFIG)])
         self.assertEqual(len(self.hooks.timers), 1)
-        self.assertEqual(
-            self.hooks.timers[0][0],
-            self.addon.MANUAL_WARM_BATCH_DELAY_MS,
-        )
-
         self._run_next_timer()
 
-        self.assertEqual(collection.get_card_ids, [1, 2])
-        self.assertEqual(
-            prefetcher.enqueued,
-            [("first", _DEFAULT_CONFIG), ("second", _DEFAULT_CONFIG)],
-        )
-        self.assertEqual(
-            self.hooks.tooltips[-1],
-            "Queued 2 cards for TTS audio caching",
-        )
+        self.assertEqual(self.hooks.timers, [])
+        self.assertEqual(len(collection.get_card_ids), 50)
+        self.assertEqual(len(prefetcher.enqueued), 50)
 
-    def test_warm_all_audio_cache_reports_progress_before_final_queue_count(self):
-        collection = _FakeCollection(
-            {
-                1: _FakeDueCard(1, "first"),
-                2: _FakeDueCard(2, "second"),
-                3: _FakeDueCard(3, "third"),
-            }
-        )
+    def test_query_op_is_used_without_modal_progress(self):
+        ops = []
+
+        class FakeQueryOp:
+            def __init__(self, parent, op, success):
+                self.op = op
+                self.success = success
+                self.failure_callback = None
+                self.progress = None
+                ops.append(self)
+
+            def failure(self, callback):
+                self.failure_callback = callback
+                return self
+
+            def with_progress(self, label=None):
+                self.progress = label
+                return self
+
+            def run_in_background(self):
+                self.success(self.op(self_addon.mw.col))
+
+        self_addon = self.addon
+        operations = types.ModuleType("aqt.operations")
+        operations.QueryOp = FakeQueryOp
+        sys.modules["aqt.operations"] = operations
+        self.addCleanup(sys.modules.pop, "aqt.operations", None)
+        collection = _FakeCollection({1: _FakeDueCard(1, "speakable")})
         self.addon.mw.col = collection
-        self.addon.MANUAL_WARM_BATCH_SIZE = 1
-        self.addon.WARM_PROGRESS_INTERVAL_CARDS = 2
         prefetcher = _FakePrefetcher()
         self.addon._engine = _FakeEngine()
         self.addon._prefetcher = None
         self.addon.AudioPrefetcher = lambda _engine: prefetcher
 
         self.addon.warm_all_audio_cache()
-        self._run_next_timer()
+        self.addon.on_sync_did_finish()
+        self._run_all_timers()
 
-        self.assertEqual(
-            self.hooks.tooltips[-1],
-            "Queueing TTS audio cache...",
-        )
-
-        self._run_next_timer()
-
-        self.assertEqual(
-            self.hooks.tooltips[-1],
-            "Queueing TTS audio cache: 2/3 cards checked; 2 queued",
-        )
-
-        self._run_next_timer()
-
-        self.assertEqual(
-            self.hooks.tooltips[-1],
-            "Queued 3 cards for TTS audio caching",
-        )
+        self.assertEqual(len(ops), 2)
+        # A modal progress dialog would block reviewing for the whole scan.
+        self.assertIsNone(ops[0].progress)
+        self.assertIsNone(ops[1].progress)
+        self.assertIsNotNone(ops[1].failure_callback)
+        self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
 
     def _write_cached_audio(self, cache, text, speed=1.5):
         audio_cache_module = importlib.import_module("anki_tts_addon.audio_cache")
@@ -1058,7 +1067,7 @@ class ReviewerHookTests(unittest.TestCase):
             self.assertEqual(entry["status"], "pending")
             self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
 
-    def test_warm_all_audio_cache_marks_cached_keys_succeeded_without_queueing(self):
+    def test_warm_all_audio_cache_skips_cached_keys_without_state_writes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             cache = self.addon.AudioCache(root / "cache")
@@ -1077,12 +1086,54 @@ class ReviewerHookTests(unittest.TestCase):
             self.addon.warm_all_audio_cache()
             self._run_all_timers()
 
-            self.assertEqual(state.entry(key)["status"], "succeeded")
+            self.assertIsNone(state.entry(key))
             self.assertEqual(prefetcher.enqueued, [])
             self.assertEqual(
                 self.hooks.tooltips[-1],
                 "Queued 0 cards for TTS audio caching",
             )
+
+    def test_refused_enqueue_rolls_back_pending_mark(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json")
+            self.addon._audio_cache_state = state
+            self.addon.mw.col = _FakeCollection({1: _FakeDueCard(1, "speakable")})
+            prefetcher = _FakePrefetcher(enqueue_result=False)
+            self.addon._engine = _FakeEngine()
+            self.addon._prefetcher = None
+            self.addon.AudioPrefetcher = lambda _engine: prefetcher
+
+            self.addon.warm_all_audio_cache()
+            self._run_all_timers()
+
+            self.assertIsNone(state.entry(self._cache_key("speakable")))
+
+    def test_fast_worker_result_is_not_overwritten_by_pending(self):
+        class FailsImmediatelyPrefetcher(_FakePrefetcher):
+            def enqueue(self, text, config):
+                accepted = super().enqueue(text, config)
+                self.result_callback(text, config, False, "edge unavailable")
+                return accepted
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json")
+            self.addon._audio_cache_state = state
+            self.addon.mw.col = _FakeCollection({1: _FakeDueCard(1, "speakable")})
+            prefetcher = FailsImmediatelyPrefetcher()
+            self.addon._engine = _FakeEngine()
+            self.addon._prefetcher = None
+            self.addon.AudioPrefetcher = lambda _engine: prefetcher
+
+            self.addon.warm_all_audio_cache()
+            self._run_all_timers()
+
+            entry = state.entry(self._cache_key("speakable"))
+            self.assertEqual(entry["status"], "failed")
+            self.assertIsNotNone(entry["next_retry_at"])
 
     def test_warm_all_audio_cache_skips_failed_key_until_retry_time(self):
         class Clock:
@@ -1119,6 +1170,7 @@ class ReviewerHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             state = self._new_cache_state(root / "state.json")
+            state.mark_pending(self._cache_key("succeeded"), "succeeded")
             self.addon._audio_cache_state = state
 
             self.addon._on_audio_prefetch_result(
@@ -1128,13 +1180,13 @@ class ReviewerHookTests(unittest.TestCase):
                 "failed", {"speed": 1.5}, False, "network failed"
             )
 
-            success = state.entry(self._cache_key("succeeded"))
+            self.assertIsNone(state.entry(self._cache_key("succeeded")))
             failure = state.entry(self._cache_key("failed"))
-            self.assertEqual(success["status"], "succeeded")
             self.assertEqual(failure["status"], "failed")
             self.assertEqual(failure["last_error"], "network failed")
+            self.assertEqual(failure["text"], "failed")
 
-    def test_prefetch_result_callback_ignores_canceled_prefetch(self):
+    def test_prefetch_result_callback_clears_pending_for_canceled_prefetch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             state = self._new_cache_state(root / "state.json")
@@ -1146,220 +1198,199 @@ class ReviewerHookTests(unittest.TestCase):
                 "canceled", {"speed": 1.5}, None, None
             )
 
-            entry = state.entry(key)
-            self.assertEqual(entry["status"], "pending")
-            self.assertIsNone(entry["last_error"])
+            self.assertIsNone(state.entry(key))
+
+    def test_prefetch_result_callback_ignored_after_shutdown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._new_cache_state(Path(temp_dir) / "state.json")
+            self.addon._audio_cache_state = state
+            self.addon._on_profile_will_close()
+            self.addon._audio_cache_state = state
+
+            self.addon._on_audio_prefetch_result(
+                "late", {"speed": 1.5}, False, "boom"
+            )
+
+            self.assertIsNone(state.entry(self._cache_key("late")))
+
+    def _warm_with_cache(self, root, cards, prefetcher=None):
+        cache = self.addon.AudioCache(root / "cache")
+        state = self._new_cache_state(root / "state.json")
+        self.addon._audio_cache = cache
+        self.addon._audio_cache_state = state
+        collection = _FakeCollection(cards)
+        self.addon.mw.col = collection
+        prefetcher = prefetcher or _FakePrefetcher()
+        self.addon._engine = _FakeEngine()
+        self.addon._prefetcher = None
+        self.addon.AudioPrefetcher = lambda _engine: prefetcher
+        return cache, state, collection, prefetcher
 
     def test_audio_cache_status_includes_pending_and_failed_counts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            state = self._new_cache_state(root / "state.json")
-            state.mark_pending(self._cache_key("pending"), "pending")
-            state.mark_failed(self._cache_key("failed"), "network failed")
-            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
-            self.addon._audio_cache_state = state
-            self.addon.mw.col = _FakeCollection(
+            cache, state, _collection, prefetcher = self._warm_with_cache(
+                root,
                 {
-                    1: _FakeDueCard(1, "pending"),
+                    1: _FakeDueCard(1, "cached"),
                     2: _FakeDueCard(2, "failed"),
-                    3: _FakeDueCard(3, "uncounted missing"),
-                }
+                    3: _FakeDueCard(3, "missing"),
+                },
             )
+            self._write_cached_audio(cache, "cached")
+            state.mark_failed(self._cache_key("failed"), "network failed")
 
-            self.addon.show_audio_cache_status()
+            self.addon.warm_all_audio_cache()
             self._run_all_timers()
+            prefetcher.status_result = {"running": True, "active": 0, "pending": 1}
+            self.hooks.tooltips.clear()
+            self.addon.show_audio_cache_status()
 
             self.assertEqual(
-                self.hooks.tooltips[-1],
-                (
-                    "Audio cache incomplete: 0/3 cards cached; 3 missing; "
-                    "1 pending; 1 failed; worker idle"
-                ),
+                self.hooks.tooltips,
+                [
+                    "Audio cache incomplete: 1/3 cards cached; 2 missing; "
+                    "1 pending; 1 failed; worker running"
+                ],
             )
 
     def test_audio_cache_status_reports_complete_cache_for_speakable_cards(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            cache = self.addon.AudioCache(Path(temp_dir))
-            self._write_cached_audio(cache, "speakable")
-            self.addon._audio_cache = cache
-            self.addon.mw.col = _FakeCollection(
+            cache, _state, _collection, _prefetcher = self._warm_with_cache(
+                Path(temp_dir),
                 {
                     1: _FakeDueCard(1, "speakable"),
                     2: _FakeDueCard(2, "", question_html=""),
-                }
+                },
             )
+            self._write_cached_audio(cache, "speakable")
 
-            self.addon.show_audio_cache_status()
+            self.addon.warm_all_audio_cache()
             self._run_all_timers()
+            self.addon.show_audio_cache_status()
 
         self.assertEqual(
             self.hooks.tooltips[-1],
             "Audio cache complete: 1/1 cards cached; worker idle",
         )
 
-    def test_audio_cache_status_reports_missing_and_running_worker(self):
+    def test_audio_cache_status_counts_worker_successes_live(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            cache = self.addon.AudioCache(Path(temp_dir))
-            self._write_cached_audio(cache, "cached")
-            self.addon._audio_cache = cache
-            self.addon._prefetcher = _FakePrefetcher(
-                status_result={"running": True, "active": 1, "pending": 1}
-            )
-            self.addon.mw.col = _FakeCollection(
-                {
-                    1: _FakeDueCard(1, "cached"),
-                    2: _FakeDueCard(2, "missing"),
-                }
+            _cache, _state, _collection, prefetcher = self._warm_with_cache(
+                Path(temp_dir),
+                {1: _FakeDueCard(1, "one"), 2: _FakeDueCard(2, "two")},
             )
 
-            self.addon.show_audio_cache_status()
+            self.addon.warm_all_audio_cache()
             self._run_all_timers()
-
-        self.assertEqual(
-            self.hooks.tooltips[-1],
-            "Audio cache incomplete: 1/2 cards cached; 1 missing; worker running",
-        )
-
-    def test_audio_cache_status_defers_collection_scan_until_timer_fires(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
-            self.addon._audio_cache_state = self._new_cache_state(
-                root / "state.json"
-            )
-            collection = _FakeCollection({1: _FakeDueCard(1, "speakable")})
-            self.addon.mw.col = collection
-
             self.addon.show_audio_cache_status()
-
-            self.assertEqual(collection.find_queries, [])
-            self.assertEqual(collection.get_card_ids, [])
-            self.assertEqual(
-                self.hooks.tooltips[-1],
-                "Checking TTS audio cache status...",
-            )
-            self.assertEqual(len(self.hooks.timers), 1)
-
-            self._run_all_timers()
-
-            self.assertEqual(collection.find_queries, [""])
-            self.assertEqual(collection.get_card_ids, [1])
-            self.assertEqual(
-                self.hooks.tooltips[-1],
-                "Audio cache incomplete: 0/1 cards cached; 1 missing; worker idle",
-            )
-
-    def test_audio_cache_status_batches_card_rendering_across_timer_ticks(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
-            self.addon._audio_cache_state = self._new_cache_state(
-                root / "state.json"
-            )
-            collection = _FakeCollection(
-                {
-                    1: _FakeDueCard(1, "first"),
-                    2: _FakeDueCard(2, "second"),
-                }
-            )
-            self.addon.mw.col = collection
-            self.addon.STATUS_BATCH_SIZE = 1
-
-            self.addon.show_audio_cache_status()
-            self._run_next_timer()
-
-            self.assertEqual(collection.get_card_ids, [1])
-            self.assertEqual(len(self.hooks.timers), 1)
-            self.assertEqual(
-                self.hooks.timers[0][0],
-                self.addon.STATUS_BATCH_DELAY_MS,
-            )
-            self.assertEqual(
-                self.hooks.tooltips[-1],
-                "Checking TTS audio cache status...",
-            )
-
-            self._run_next_timer()
-
-            self.assertEqual(collection.get_card_ids, [1, 2])
             self.assertEqual(
                 self.hooks.tooltips[-1],
                 "Audio cache incomplete: 0/2 cards cached; 2 missing; worker idle",
             )
 
-    def test_audio_cache_status_reports_progress_before_final_status(self):
+            prefetcher.result_callback("one", _DEFAULT_CONFIG, True, None)
+            self.addon.show_audio_cache_status()
+
+        self.assertEqual(
+            self.hooks.tooltips[-1],
+            "Audio cache incomplete: 1/2 cards cached; 1 missing; worker idle",
+        )
+
+    def test_audio_cache_status_uses_persisted_counts_after_restart(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
-            self.addon._audio_cache_state = self._new_cache_state(
-                root / "state.json"
-            )
-            collection = _FakeCollection(
-                {
-                    1: _FakeDueCard(1, "first"),
-                    2: _FakeDueCard(2, "second"),
-                    3: _FakeDueCard(3, "third"),
-                }
-            )
-            self.addon.mw.col = collection
-            self.addon.STATUS_BATCH_SIZE = 1
-            self.addon.STATUS_PROGRESS_INTERVAL_CARDS = 2
+            state = self._new_cache_state(Path(temp_dir) / "state.json")
+            state.set_meta("scan_stats", {"total": 10, "missing": 4, "at": 1})
+            self.addon._audio_cache_state = state
+            self.addon.mw.col = _FakeCollection({})
 
             self.addon.show_audio_cache_status()
-            self._run_next_timer()
 
-            self.assertEqual(
-                self.hooks.tooltips[-1],
-                "Checking TTS audio cache status...",
-            )
+        self.assertEqual(
+            self.hooks.tooltips[-1],
+            "Audio cache incomplete: 6/10 cards cached; 4 missing; "
+            "as of last full scan; worker idle",
+        )
 
-            self._run_next_timer()
+    def test_status_snapshot_exposes_worker_scan_and_engine_state(self):
+        class EngineWithStatus(_FakeEngine):
+            def status_snapshot(self):
+                return {"edge": {"open": True, "retry_in": 42}, "live": {"hits": 3}}
 
-            self.assertEqual(
-                self.hooks.tooltips[-1],
-                (
-                    "Checking TTS audio cache: 2/3 cards checked; "
-                    "0/2 speakable cached"
-                ),
-            )
+        self.addon._engine = EngineWithStatus()
+        self.addon._prefetcher = _FakePrefetcher(
+            status_result={"running": True, "active": 1, "pending": 2, "paused": True}
+        )
+        self.addon.mw.col = _FakeCollection({})
 
-            self._run_next_timer()
+        snapshot = self.addon.audio_cache_status_snapshot()
 
-            self.assertEqual(
-                self.hooks.tooltips[-1],
-                "Audio cache incomplete: 0/3 cards cached; 3 missing; worker idle",
-            )
+        self.assertEqual(snapshot["worker"]["pending"], 2)
+        self.assertTrue(snapshot["worker"]["paused"])
+        self.assertEqual(snapshot["engine"]["live"], {"hits": 3})
+        self.assertIsNone(snapshot["scan"]["running"])
+        self.addon.show_audio_cache_status()
+        self.assertEqual(
+            self.hooks.tooltips[-1],
+            "Audio cache: no full scan yet (use Warm All Audio Cache); "
+            "3 pending; Edge paused, retry in 42s; worker paused",
+        )
 
     def test_warm_all_audio_cache_reports_final_status_when_prefetcher_becomes_idle(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            cache = self.addon.AudioCache(Path(temp_dir))
-            self.addon._audio_cache = cache
-            self.addon.mw.col = _FakeCollection(
-                {1: _FakeDueCard(1, "speakable")}
+            cache, _state, _collection, prefetcher = self._warm_with_cache(
+                Path(temp_dir), {1: _FakeDueCard(1, "speakable")}
             )
-            prefetcher = _FakePrefetcher()
-            self.addon._engine = _FakeEngine()
-            self.addon._prefetcher = None
-            self.addon.AudioPrefetcher = lambda _engine: prefetcher
 
             self.addon.warm_all_audio_cache()
             self._run_all_timers()
+            self.assertEqual(
+                self.hooks.tooltips[-1],
+                "Queued 1 cards for TTS audio caching",
+            )
             self._write_cached_audio(cache, "speakable")
+            prefetcher.result_callback("speakable", _DEFAULT_CONFIG, True, None)
             prefetcher.idle_callback()
             self._run_all_timers()
 
         self.assertEqual(
-            self.hooks.tooltips[-3],
-            "Queued 1 cards for TTS audio caching",
-        )
-        self.assertEqual(
             self.hooks.tooltips[-2],
-            "Checking TTS audio cache status...",
+            "Queued 1 cards for TTS audio caching",
         )
         self.assertEqual(
             self.hooks.tooltips[-1],
             "Audio cache complete: 1/1 cards cached; worker idle",
         )
+
+    def test_idle_while_worker_still_busy_does_not_notify(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _cache, _state, _collection, prefetcher = self._warm_with_cache(
+                Path(temp_dir), {1: _FakeDueCard(1, "speakable")}
+            )
+            self.addon.warm_all_audio_cache()
+            self._run_all_timers()
+            prefetcher.status_result = {"running": True, "active": 1, "pending": 0}
+
+            prefetcher.idle_callback()
+
+        self.assertEqual(
+            self.hooks.tooltips[-1],
+            "Queued 1 cards for TTS audio caching",
+        )
+
+    def test_auto_warm_never_shows_status_on_idle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _cache, _state, _collection, prefetcher = self._warm_with_cache(
+                Path(temp_dir), {1: _FakeDueCard(1, "speakable")}
+            )
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+            prefetcher.result_callback("speakable", _DEFAULT_CONFIG, True, None)
+            prefetcher.idle_callback()
+            self._run_all_timers()
+
+        self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
+        self.assertEqual(self.hooks.tooltips, [])
 
     def test_warm_all_audio_cache_shows_queued_before_fast_idle_status(self):
         class FastIdlePrefetcher(_FakePrefetcher):
@@ -1371,32 +1402,27 @@ class ReviewerHookTests(unittest.TestCase):
                 accepted = super().enqueue(text, config)
                 if accepted:
                     self.cache_writer(text)
+                    self.result_callback(text, config, True, None)
                     self.idle_callback()
                 return accepted
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            cache = self.addon.AudioCache(Path(temp_dir))
-            self.addon._audio_cache = cache
-            self.addon.mw.col = _FakeCollection(
-                {1: _FakeDueCard(1, "speakable")}
-            )
+            root = Path(temp_dir)
+            cache = self.addon.AudioCache(root / "cache")
             prefetcher = FastIdlePrefetcher(
                 lambda text: self._write_cached_audio(cache, text)
             )
-            self.addon._engine = _FakeEngine()
-            self.addon._prefetcher = None
-            self.addon.AudioPrefetcher = lambda _engine: prefetcher
+            self._warm_with_cache(
+                root, {1: _FakeDueCard(1, "speakable")}, prefetcher
+            )
+            self.addon._audio_cache = cache
 
             self.addon.warm_all_audio_cache()
             self._run_all_timers()
 
         self.assertEqual(
-            self.hooks.tooltips[-3],
-            "Queued 1 cards for TTS audio caching",
-        )
-        self.assertEqual(
             self.hooks.tooltips[-2],
-            "Checking TTS audio cache status...",
+            "Queued 1 cards for TTS audio caching",
         )
         self.assertEqual(
             self.hooks.tooltips[-1],
@@ -1417,13 +1443,12 @@ class ReviewerHookTests(unittest.TestCase):
 
         self.assertEqual(collection.find_queries, [])
         self.assertEqual(prefetcher.enqueued, [])
-        self.assertEqual(len(self.hooks.timers), 1)
         self.assertEqual(
-            self.hooks.timers[0][0],
-            self.addon.AUTO_WARM_START_DELAY_MS,
+            [delay for delay, _ in self._delayed_timers()],
+            [self.addon.AUTO_WARM_START_DELAY_MS],
         )
 
-        self.hooks.timers.pop(0)[1]()
+        self._run_all_timers()
 
         self.assertEqual(collection.find_queries, [""])
         self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
@@ -1443,44 +1468,418 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(prefetcher.enqueued, [])
         self.assertEqual(len(self.hooks.timers), 1)
 
-        self.hooks.timers.pop(0)[1]()
+        self._run_all_timers()
 
         self.assertEqual(collection.find_queries, [""])
         self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
         self.assertEqual(self.hooks.tooltips, [])
 
-    def test_auto_warm_batches_card_rendering_across_timer_ticks(self):
-        collection = _FakeCollection(
+    def _set_up_auto_warm(self, cards):
+        collection = _FakeCollection(cards)
+        self.addon.mw.col = collection
+        prefetcher = _FakePrefetcher()
+        self.addon._engine = _FakeEngine()
+        self.addon._prefetcher = None
+        self.addon.AudioPrefetcher = lambda _engine: prefetcher
+        return collection, prefetcher
+
+    def test_scan_runs_in_small_collection_ops_so_anki_ops_can_interleave(self):
+        self.addon.SCAN_CHUNK_CARDS = 10
+        collection, prefetcher = self._set_up_auto_warm(
+            {card_id: _FakeDueCard(card_id, f"card {card_id}") for card_id in range(1, 26)}
+        )
+
+        self.addon.warm_all_audio_cache()
+        self._run_all_timers()
+
+        scan_ops = [
+            call for call in self.hooks.background_calls
+            if "uses_collection" not in call["kwargs"]
+        ]
+        self.assertEqual(len(scan_ops), 3)
+        self.assertEqual(len(collection.get_card_ids), 25)
+        self.assertEqual(len(prefetcher.enqueued), 25)
+        self.assertIsNone(self.addon._warm_job)
+        self.assertEqual(
+            self.hooks.tooltips[-1], "Queued 25 cards for TTS audio caching"
+        )
+
+    def test_sync_start_between_scan_chunks_stops_the_scan(self):
+        self.addon.SCAN_CHUNK_CARDS = 10
+        collection, prefetcher = self._set_up_auto_warm(
+            {card_id: _FakeDueCard(card_id, f"card {card_id}") for card_id in range(1, 26)}
+        )
+
+        self.addon.warm_all_audio_cache()
+        self._run_next_timer()  # first chunk
+        self.addon.on_sync_will_start()
+        self._run_all_timers()
+
+        self.assertEqual(len(collection.get_card_ids), 10)
+        self.assertEqual(prefetcher.enqueued, [])
+        self.assertIsNone(self.addon._warm_job)
+        # Deferred, not dropped: it runs again once the sync is over.
+        self.assertIsNotNone(self.addon._warm_rescan)
+        self.assertEqual(self.addon._warm_stats.snapshot()["recent_errors"], ())
+
+    def test_scan_op_ignores_a_different_collection(self):
+        collection, prefetcher = self._set_up_auto_warm(
+            {1: _FakeDueCard(1, "speakable")}
+        )
+        self.addon.warm_all_audio_cache()
+        self.addon.mw.col = _FakeCollection({2: _FakeDueCard(2, "other")})
+        self._run_all_timers()
+
+        self.assertEqual(collection.get_card_ids, [])
+        self.assertEqual(prefetcher.enqueued, [])
+        self.assertIsNone(self.addon._warm_job)
+
+    def test_incremental_query_ignores_unsynced_usn_and_checks_note_types(self):
+        collection = _FakeCollection({})
+        self.addon._select_card_ids(collection, {"mod": 100, "usn": 7})
+
+        sql, args = collection.db.list_queries[-1]
+        self.assertNotIn("-1", sql)
+        self.assertIn("notetypes", sql)
+        self.assertEqual(args, (100, 100, 7, 7, 100, 7))
+
+    def test_incremental_query_falls_back_without_notetypes_table(self):
+        class OldSchemaDb(_FakeDb):
+            def list(self, sql, *args):
+                if "notetypes" in sql:
+                    raise RuntimeError("no such table: notetypes")
+                return super().list(sql, *args)
+
+        collection = _FakeCollection({})
+        collection.changed_ids = [5]
+        collection.db = OldSchemaDb(collection)
+
+        self.assertEqual(
+            self.addon._select_card_ids(collection, {"mod": 1, "usn": 2}), [5]
+        )
+
+    def test_question_hook_does_not_rerender_when_reviewer_html_is_cached(self):
+        class CountingCard(_FakeCard):
+            renders = 0
+
+            def question(self):
+                CountingCard.renders += 1
+                return super().question()
+
+        card = CountingCard()
+        engine = _FakeEngine()
+        self.addon._engine = engine
+        self.addon.cache_review_html(
+            "Shown question", card, self.addon.REVIEW_QUESTION_CONTEXT
+        )
+
+        self.addon.on_reviewer_did_show_question(card)
+
+        self.assertEqual(CountingCard.renders, 0)
+        self.assertEqual(engine.spoken[0][0], "Shown question")
+
+    def test_review_html_cache_is_bounded(self):
+        module = importlib.import_module("anki_tts_addon.review_html_cache")
+        for card_id in range(module.MAX_ENTRIES + 10):
+            card = types.SimpleNamespace(id=card_id)
+            module.cache_review_html("q", card, module.REVIEW_QUESTION_CONTEXT)
+
+        self.assertEqual(len(module._review_html_by_card), module.MAX_ENTRIES)
+        newest = types.SimpleNamespace(id=module.MAX_ENTRIES + 9)
+        oldest = types.SimpleNamespace(id=0)
+        ctx = module.REVIEW_QUESTION_CONTEXT
+        self.assertEqual(module.get_review_html(newest, ctx, None), "q")
+        self.assertIsNone(module.get_review_html(oldest, ctx, None))
+
+    def test_reviewer_end_does_not_create_an_engine(self):
+        self.addon._engine = None
+
+        self.addon.on_reviewer_will_end()
+
+        self.assertIsNone(self.addon._engine)
+
+    def test_profile_close_finishes_cleanup_when_a_step_fails(self):
+        class BrokenStateEngine(_FakeEngine):
+            def stop(self):
+                raise RuntimeError("speech process vanished")
+
+        self.addon._menu_added = True
+        self.addon._hooks_registered = False
+        self.addon._engine = _FakeEngine()
+        self.addon._prefetcher = _FakePrefetcher()
+        self.addon._on_profile_did_open()
+        prefetcher = self.addon._prefetcher
+        self.addon._engine = BrokenStateEngine()
+
+        with self.assertLogs(self.addon.log, level="WARNING"):
+            self.addon._on_profile_will_close()
+
+        self.assertTrue(prefetcher.stopped)
+        self.assertIsNone(self.addon._engine)
+        self.assertFalse(self.addon._hooks_registered)
+        self.assertEqual(self.hooks.reviewer_did_show_question, [])
+        self.assertEqual(self.hooks.sync_did_finish, [])
+
+    def test_state_flush_after_idle_does_not_use_collection_executor(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._new_cache_state(Path(temp_dir) / "state.json")
+            state.set_meta("x", 1)
+            self.addon._audio_cache_state = state
+
+            self.addon._flush_state_in_background()
+
+            self.assertEqual(
+                self.hooks.background_calls[-1]["kwargs"],
+                {"uses_collection": False},
+            )
+
+    def test_idle_handler_errors_never_escape_to_anki(self):
+        self.addon._pending_watermark = ("key", {"mod": 1})
+
+        def broken_state():
+            raise OSError("disk full")
+
+        self.addon.audio_cache_state = broken_state
+        with self.assertLogs(self.addon.log, level="WARNING"):
+            self.addon._on_prefetch_idle_main()
+
+    def test_sync_uses_incremental_scan_after_watermark_is_committed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            self.addon._audio_cache_state = self._new_cache_state(root / "state.json")
+            collection, prefetcher = self._set_up_auto_warm(
+                {1: _FakeDueCard(1, "one"), 2: _FakeDueCard(2, "two")}
+            )
+
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+            self.assertEqual(collection.find_queries, [""])
+            prefetcher.result_callback("one", _DEFAULT_CONFIG, True, None)
+            prefetcher.result_callback("two", _DEFAULT_CONFIG, True, None)
+            prefetcher.idle_callback()
+            self._run_all_timers()
+
+            collection.changed_ids = [2]
+            collection.get_card_ids.clear()
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+
+            self.assertEqual(collection.find_queries, [""])
+            self.assertEqual(len(collection.db.list_queries), 1)
+            self.assertEqual(collection.get_card_ids, [2])
+
+    def test_watermark_not_committed_while_queued_audio_is_unfinished(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            self.addon._audio_cache_state = self._new_cache_state(root / "state.json")
+            collection, prefetcher = self._set_up_auto_warm(
+                {1: _FakeDueCard(1, "one")}
+            )
+
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+
+            # Quit before the worker drained: next pass must scan everything.
+            self.assertEqual(collection.find_queries, ["", ""])
+            self.assertEqual(collection.db.list_queries, [])
+
+    def test_speed_change_forces_full_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            self.addon._audio_cache_state = self._new_cache_state(root / "state.json")
+            collection, prefetcher = self._set_up_auto_warm({})
+
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+            self.set_config(speed=1.25)
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+
+            self.assertEqual(collection.find_queries, ["", ""])
+
+    def test_sync_will_start_cancels_scheduled_and_running_warm(self):
+        collection, prefetcher = self._set_up_auto_warm(
+            {1: _FakeDueCard(1, "speakable")}
+        )
+        self.addon.on_sync_did_finish()
+        self.addon.on_sync_will_start()
+        self._run_all_timers()
+        self.assertEqual(collection.find_queries, [])
+
+        self.addon.warm_all_audio_cache()
+        self.assertEqual(
+            self.hooks.tooltips[-1],
+            "TTS audio scan will run after the current scan or sync finishes",
+        )
+        self._run_all_timers()
+        self.assertEqual(collection.find_queries, [])
+
+        self.addon.on_sync_did_finish()
+        self._run_all_timers()
+
+        # The manual request deferred by the sync runs as a full, manual scan.
+        self.assertEqual(collection.find_queries, [""])
+        self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
+        self.assertEqual(
+            self.hooks.tooltips[-1],
+            "Queued 1 cards for TTS audio caching",
+        )
+
+    def test_sync_start_aborts_scan_already_in_background(self):
+        collection, prefetcher = self._set_up_auto_warm(
+            {1: _FakeDueCard(1, "speakable")}
+        )
+        self.addon.on_sync_did_finish()
+        self._run_next_timer()  # scheduled timer: submits the background op
+        self.addon.on_sync_will_start()
+        self._run_all_timers()
+
+        self.assertEqual(collection.get_card_ids, [])
+        self.assertEqual(prefetcher.enqueued, [])
+        self.assertIsNone(self.addon._warm_job)
+
+    def test_profile_job_is_not_current_while_syncing_or_collection_closed(self):
+        collection = _FakeCollection({})
+        self.addon.mw.col = collection
+        generation = self.addon._profile_generation
+
+        self.assertTrue(self.addon._profile_job_is_current(generation, collection))
+        self.addon.on_sync_will_start()
+        self.assertFalse(self.addon._profile_job_is_current(generation, collection))
+        self.addon.on_sync_did_finish()
+        collection.db = None
+        self.assertFalse(self.addon._profile_job_is_current(generation, collection))
+
+    def test_overlapping_triggers_run_one_scan_then_one_rescan(self):
+        collection, prefetcher = self._set_up_auto_warm(
+            {1: _FakeDueCard(1, "speakable")}
+        )
+        self.addon.on_sync_did_finish()
+        self._run_next_timer()  # job running, background op pending
+        self.addon.warm_all_audio_cache()
+        self.addon.warm_all_audio_cache()
+
+        self.assertEqual(len(self.hooks.timers), 1)
+        self._run_all_timers()
+
+        self.assertEqual(collection.find_queries, ["", ""])
+        self.assertIsNone(self.addon._warm_job)
+        self.assertIsNone(self.addon._warm_rescan)
+
+    def test_stale_scheduled_timer_does_not_clear_new_schedule(self):
+        collection, _prefetcher = self._set_up_auto_warm({})
+        self.addon._schedule_auto_warm_all_audio_cache(10)
+        stale = self.hooks.timers.pop(0)[1]
+        self.addon._cancel_scheduled_auto_warm()
+        self.addon._schedule_auto_warm_all_audio_cache(10)
+
+        stale()
+        self.addon._schedule_auto_warm_all_audio_cache(10)
+
+        self.assertEqual(len(self.hooks.timers), 1)
+        self.assertTrue(self.addon._warm_scheduled)
+
+    def test_deleted_card_during_scan_is_skipped_without_error(self):
+        class DeletingCollection(_FakeCollection):
+            def get_card(self, card_id):
+                if card_id == 2:
+                    raise KeyError("card deleted")
+                return super().get_card(card_id)
+
+        collection = DeletingCollection(
             {
                 1: _FakeDueCard(1, "first"),
-                2: _FakeDueCard(2, "second"),
+                2: _FakeDueCard(2, "deleted"),
+                3: _FakeDueCard(3, "third"),
             }
         )
         self.addon.mw.col = collection
-        self.addon.AUTO_WARM_BATCH_SIZE = 1
         prefetcher = _FakePrefetcher()
         self.addon._engine = _FakeEngine()
         self.addon._prefetcher = None
         self.addon.AudioPrefetcher = lambda _engine: prefetcher
 
-        self.addon.on_sync_did_finish()
-        self.hooks.timers.pop(0)[1]()
+        self.addon.warm_all_audio_cache()
+        self._run_all_timers()
 
-        self.assertEqual(collection.get_card_ids, [1])
-        self.assertEqual(prefetcher.enqueued, [("first", _DEFAULT_CONFIG)])
-        self.assertEqual(len(self.hooks.timers), 1)
-        self.assertEqual(
-            self.hooks.timers[0][0],
-            self.addon.AUTO_WARM_BATCH_DELAY_MS,
-        )
-
-        self.hooks.timers.pop(0)[1]()
-
-        self.assertEqual(collection.get_card_ids, [1, 2])
         self.assertEqual(
             prefetcher.enqueued,
-            [("first", _DEFAULT_CONFIG), ("second", _DEFAULT_CONFIG)],
+            [("first", _DEFAULT_CONFIG), ("third", _DEFAULT_CONFIG)],
         )
+        self.assertIsNone(self.addon._warm_job)
+        self.assertEqual(
+            self.addon.audio_cache_status_snapshot()["scan"]["last"]["errors"], 1
+        )
+
+    def test_scan_failure_finishes_job_and_allows_next_scan(self):
+        class BrokenCollection(_FakeCollection):
+            def find_cards(self, query):
+                super().find_cards(query)
+                raise RuntimeError("collection closed")
+
+        collection = BrokenCollection({})
+        self.addon.mw.col = collection
+        self.addon._engine = _FakeEngine()
+        self.addon._prefetcher = _FakePrefetcher()
+
+        with self.assertLogs(self.addon.log, level="WARNING"):
+            self.addon.warm_all_audio_cache()
+            self._run_all_timers()
+            self.addon.warm_all_audio_cache()
+            self._run_all_timers()
+
+        self.assertEqual(collection.find_queries, ["", ""])
+        self.assertIsNone(self.addon._warm_job)
+        self.assertEqual(
+            self.hooks.tooltips[-1],
+            "TTS audio scan failed: collection closed",
+        )
+
+    def test_warm_stops_queueing_when_tts_disabled_during_scan(self):
+        collection, prefetcher = self._set_up_auto_warm(
+            {1: _FakeDueCard(1, "speakable")}
+        )
+        self.addon.warm_all_audio_cache()
+        self.set_config(enabled=False)
+        self.addon._sync_prefetcher_with_config(self.addon.get_config())
+        self._run_all_timers()
+
+        self.assertEqual(prefetcher.enqueued, [])
+        self.assertIsNone(self.addon._warm_job)
+
+    def test_failed_items_with_text_are_retried_without_rescanning_card(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json", now=lambda: 0)
+            state.mark_failed(self._cache_key("old failure"), "boom", "old failure")
+            self.addon._audio_cache_state = state
+            state._now = lambda: 10_000
+            collection, prefetcher = self._set_up_auto_warm({})
+
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+
+            self.assertEqual(prefetcher.enqueued, [("old failure", _DEFAULT_CONFIG)])
+
+    def test_profile_open_registers_quit_hook_once(self):
+        connected = []
+        self.addon.mw.app = types.SimpleNamespace(
+            aboutToQuit=types.SimpleNamespace(connect=connected.append)
+        )
+        self.addon._menu_added = True
+        self.addon._hooks_registered = True
+        self.addon._prefetcher = _FakePrefetcher()
+
+        self.addon._on_profile_did_open()
+        self.addon._on_profile_did_open()
+
+        self.assertEqual(connected, [self.addon._on_app_about_to_quit])
 
     def test_clear_audio_cache_stops_resets_prefetcher_and_removes_audio_files(self):
         prefetcher = _FakePrefetcher()
@@ -1505,6 +1904,14 @@ class ReviewerHookTests(unittest.TestCase):
 
             self.addon.clear_audio_cache()
 
+            # Files are unlinked in the background, never on the UI thread.
+            self.assertTrue(audio_file.exists())
+            self.assertEqual(
+                self.hooks.background_calls[-1]["kwargs"],
+                {"uses_collection": False},
+            )
+            self._run_all_timers()
+
             self.assertFalse(audio_file.exists())
             self.assertFalse(second_audio_file.exists())
             self.assertTrue(non_audio_file.exists())
@@ -1523,8 +1930,21 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(self.hooks.tooltips[-1], "Cleared 2 TTS audio files")
         self.assertEqual(
             state.summary(),
-            {"pending": 0, "succeeded": 0, "failed": 0},
+            {"pending": 0, "failed": 0},
         )
+
+    def test_confirm_clear_audio_cache_asks_first(self):
+        calls = []
+        self.addon.clear_audio_cache = lambda: calls.append("clear")
+
+        self.hooks.ask_user_answers.append(False)
+        self.addon.confirm_clear_audio_cache()
+        self.assertEqual(calls, [])
+
+        self.hooks.ask_user_answers.append(True)
+        self.addon.confirm_clear_audio_cache()
+        self.assertEqual(calls, ["clear"])
+        self.assertEqual(len(self.hooks.ask_user_questions), 2)
 
     def test_clear_audio_cache_cancels_engine_before_stopping_prefetcher(self):
         events = []

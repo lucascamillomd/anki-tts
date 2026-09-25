@@ -205,5 +205,30 @@ class ExtractSpeakableTextTests(unittest.TestCase):
         )
 
 
+    def test_av_placeholder_is_not_spoken_and_matches_live_replay_button(self):
+        # Warm-up renders question_text with [anki:play:q:N] placeholders;
+        # the live reviewer HTML has them replaced by replay-button anchors.
+        # Both must extract to the same text so they share one cache key.
+        warm = extract_speakable_text("Hello [anki:play:q:0] world")
+        live = extract_speakable_text(
+            'Hello <a class="replay-button soundLink" href=# '
+            "onclick=\"pycmd('play:q:0'); return false;\">"
+            '<svg class="playImage" viewBox="0 0 64 64" version="1.1">'
+            '<circle cx="32" cy="32" r="29" /><path d="M56.502,32.301Z" />'
+            "</svg></a> world"
+        )
+
+        self.assertEqual(warm, "Hello world")
+        self.assertEqual(live, warm)
+
+    def test_raw_sound_tag_is_not_spoken(self):
+        self.assertEqual(
+            extract_speakable_text("Say [sound:word_123.mp3] this"),
+            "Say this",
+        )
+
+    def test_audio_only_question_is_empty(self):
+        self.assertEqual(extract_speakable_text("[anki:play:q:0]"), "")
+
 if __name__ == "__main__":
     unittest.main()
