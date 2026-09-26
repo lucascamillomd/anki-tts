@@ -6,9 +6,12 @@ Edge TTS is bundled in vendor/ and imported directly.
 
 import asyncio
 import concurrent.futures
+import errno
 import os
+import ssl
 import sys
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -34,6 +37,13 @@ _TIMEOUT_ERRORS = (
     concurrent.futures.TimeoutError,
 )
 
+_NETWORK_ERRNOS = {
+    errno.ENETDOWN,
+    errno.ENETUNREACH,
+    errno.EHOSTDOWN,
+    errno.EHOSTUNREACH,
+}
+
 
 class _SpeechCancelled(Exception):
     pass
@@ -54,6 +64,35 @@ def _notify(msg: str):
             log.debug("TTS status callback failed", exc_info=True)
 
 
+def _exception_chain(exc: BaseException):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def _is_tls_error(exc: BaseException) -> bool:
+    # Match on types, not text: every aiohttp connector error message embeds
+    # "ssl:<context>", so a plain DNS failure would read as a TLS problem.
+    return any(
+        isinstance(e, ssl.SSLError)
+        or type(e).__name__ in ("ClientSSLError", "ClientConnectorCertificateError")
+        for e in _exception_chain(exc)
+    )
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """True for connectivity failures (offline, DNS, refused), not TLS."""
+    if _is_tls_error(exc):
+        return False
+    return any(
+        isinstance(e, (socket.gaierror, ConnectionError))
+        or (isinstance(e, OSError) and e.errno in _NETWORK_ERRNOS)
+        for e in _exception_chain(exc)
+    )
+
+
 def _edge_error_reason(exc: Exception) -> str:
     """Return a short user-facing reason for Edge TTS failure."""
     if isinstance(exc, ModuleNotFoundError):
@@ -62,14 +101,21 @@ def _edge_error_reason(exc: Exception) -> str:
     if isinstance(exc, _TIMEOUT_ERRORS):
         return "request timed out"
 
+    if _is_tls_error(exc):
+        return "TLS/certificate error"
+    if _is_network_error(exc):
+        return "network connection failed"
+
     msg = str(exc).strip()
     low = msg.lower()
-    if "certificate verify failed" in low or "ssl" in low:
+    if "certificate verify failed" in low:
         return "TLS/certificate error"
     if (
         "cannot connect" in low
         or "name or service not known" in low
+        or "nodename nor servname" in low
         or "temporary failure in name resolution" in low
+        or "network is unreachable" in low
         or "connection reset" in low
         or "connection refused" in low
     ):
@@ -450,17 +496,24 @@ class TTSEngine:
             return False
         except _TIMEOUT_ERRORS as e:
             self._record_edge_failure(e)
-            log.warning("Edge TTS prefetch timed out: %s", e)
+            log.warning(
+                "Edge TTS prefetch timed out: %s", str(e) or type(e).__name__
+            )
             self._local.prefetch_error = "request timed out"
             return False
         except Exception as e:
             # A transient Edge error must not disable the remaining cache queue.
             # Let the worker record the real error for this card and continue.
             self._record_edge_failure(e)
-            log.warning(
-                "Edge TTS prefetch failed: %s", _edge_error_reason(e)
-            )
-            raise
+            reason = _edge_error_reason(e)
+            if not _is_network_error(e):
+                log.warning("Edge TTS prefetch failed: %s", reason)
+                raise
+            # Being offline is expected: one line, no traceback. The breaker
+            # still pauses the queue until the network is back.
+            log.warning("Edge TTS prefetch failed: %s (%s)", reason, e)
+            self._local.prefetch_error = reason
+            return False
         else:
             self._breaker.record_success()
             self._cleanup_cache()

@@ -1,5 +1,7 @@
 import sys
 import asyncio
+import socket
+import ssl
 import tempfile
 import threading
 import time
@@ -51,6 +53,28 @@ class FailingEdgeTTS:
 
         async def save(self, path):
             raise RuntimeError("cannot connect to Edge service")
+
+
+class _FakeClientConnectorError(OSError):
+    """Mimics aiohttp: every connector error message carries 'ssl:<ctx>'."""
+
+    def __init__(self, cause):
+        super().__init__(
+            "Cannot connect to host speech.platform.bing.com:443 "
+            f"ssl:<truststore._api.SSLContext object at 0x1> [{cause}]"
+        )
+        self.__cause__ = cause
+
+
+class OfflineEdgeTTS:
+    class Communicate:
+        def __init__(self, text, voice, rate):
+            pass
+
+        async def save(self, path):
+            raise _FakeClientConnectorError(
+                socket.gaierror(8, "nodename nor servname provided, or not known")
+            )
 
 
 class HangingEdgeTTS:
@@ -483,6 +507,47 @@ class TTSEngineCacheTests(unittest.TestCase):
             self.assertTrue(cache.path_for_key(key).exists())
             self.assertEqual(cache.path_for_key(key).read_bytes(), FAKE_EDGE_BYTES)
             self.assertEqual(results, [True])
+
+    def test_offline_errors_are_reported_as_network_not_tls(self):
+        reason = _TTS_ENGINE_MODULE._edge_error_reason
+        dns = _FakeClientConnectorError(
+            socket.gaierror(8, "nodename nor servname provided, or not known")
+        )
+        unreachable = _FakeClientConnectorError(
+            OSError(51, "Network is unreachable")
+        )
+        self.assertEqual(reason(dns), "network connection failed")
+        self.assertEqual(reason(unreachable), "network connection failed")
+
+    def test_certificate_errors_are_still_reported_as_tls(self):
+        cert = _FakeClientConnectorError(
+            ssl.SSLCertVerificationError("certificate verify failed")
+        )
+        self.assertEqual(
+            _TTS_ENGINE_MODULE._edge_error_reason(cert), "TLS/certificate error"
+        )
+
+    def test_empty_timeout_reason_is_not_blank(self):
+        self.assertEqual(
+            _TTS_ENGINE_MODULE._edge_error_reason(TimeoutError()),
+            "request timed out",
+        )
+
+    def test_offline_prefetch_fails_card_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._get_edge_tts = lambda: OfflineEdgeTTS
+
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING") as logs:
+                self.assertFalse(engine.prefetch("hello", {"speed": 1.5}))
+
+            self.assertEqual(
+                engine.last_prefetch_error(), "network connection failed"
+            )
+            self.assertTrue(
+                all(r.exc_info is None for r in logs.records)
+            )
+            self.assertIn("network connection failed", logs.output[-1])
 
     def test_prefetch_failure_does_not_disable_later_cards(self):
         with tempfile.TemporaryDirectory() as tmpdir:
