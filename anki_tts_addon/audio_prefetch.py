@@ -11,6 +11,10 @@ class AudioPrefetcher:
     _SENTINEL = object()
     PAUSE_POLL_SECONDS = 0.5
     USER_PAUSE_POLL_SECONDS = 0.25
+    # Each request is ~1 s of network wait, not CPU, so a few concurrent
+    # requests multiply throughput. Kept small: Microsoft may throttle.
+    WORKERS = 1
+    MAX_WORKERS = 4
 
     def __init__(self, engine):
         self.engine = engine
@@ -19,19 +23,22 @@ class AudioPrefetcher:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
+        self._extra_threads = []
+        self._workers = self.WORKERS
         self._accepting = True
         self._stop_requested = False
         self._active_count = 0
         self._idle_callback = None
         self._result_callback = None
         self._idle_notified = True
-        self._paused = False
+        # Threads holding the queue while Edge is unavailable.
+        self._edge_waiters = 0
         # User pause (monitor button). Set while running; cleared while paused.
         self._user_paused = False
         self._run_gate = threading.Event()
         self._run_gate.set()
-        self._current = None
-        self._current_started_at = None
+        # Thread ident -> (item preview, monotonic start) for active items.
+        self._in_flight = {}
         self._succeeded = 0
         self._failed = 0
         self._canceled = 0
@@ -68,6 +75,11 @@ class AudioPrefetcher:
             self._user_paused = False
             self._run_gate.set()
 
+    def set_workers(self, count):
+        """Number of concurrent requests; takes effect at the next start()."""
+        with self._lock:
+            self._workers = max(1, min(self.MAX_WORKERS, int(count)))
+
     def is_paused(self):
         with self._lock:
             return self._user_paused
@@ -85,19 +97,26 @@ class AudioPrefetcher:
         with self._lock:
             active = self._active_count
             pending = max(0, len(self._queued_keys) - active)
-            alive = self._thread is not None and self._thread.is_alive()
+            alive = any(t.is_alive() for t in self._threads_locked())
             running = alive or active > 0 or pending > 0
+            # The oldest active item, so a slow request stays visible.
+            current, started = min(
+                self._in_flight.values(),
+                key=lambda item: item[1],
+                default=(None, None),
+            )
+            edge_waiting = self._edge_waiters > 0
             return {
                 "running": running,
                 "alive": alive,
                 "active": active,
                 "pending": pending,
-                "paused": self._paused or self._user_paused,
+                "paused": edge_waiting or self._user_paused,
                 "user_paused": self._user_paused,
-                "edge_waiting": self._paused,
+                "edge_waiting": edge_waiting,
                 "stopping": self._stop_requested,
-                "current": self._current,
-                "current_started_at": self._current_started_at,
+                "current": current,
+                "current_started_at": started,
                 "succeeded": self._succeeded,
                 "failed": self._failed,
                 "canceled": self._canceled,
@@ -123,6 +142,15 @@ class AudioPrefetcher:
                 target=self._run, daemon=True, name="anki-tts-prefetch"
             )
             self._thread.start()
+            self._extra_threads = []
+            for index in range(1, self._workers):
+                thread = threading.Thread(
+                    target=self._run,
+                    daemon=True,
+                    name=f"anki-tts-prefetch-{index}",
+                )
+                thread.start()
+                self._extra_threads.append(thread)
             return True
 
     def stop(self, timeout=None):
@@ -132,15 +160,18 @@ class AudioPrefetcher:
             self._stop_event.set()
             # Wake a user-paused worker so it can never block quit.
             self._run_gate.set()
-            thread = self._thread
-            if thread is None or not thread.is_alive():
+            primary = self._thread
+            threads = [t for t in self._threads_locked() if t.is_alive()]
+            if not threads:
                 self._thread = None
+                self._extra_threads = []
                 self._stop_requested = False
                 self._discard_pending_locked()
                 return True
 
             self._discard_pending_locked()
-            self._queue.put(self._SENTINEL)
+            for _ in threads:
+                self._queue.put(self._SENTINEL)
 
         # Abort the in-flight network request so the worker exits promptly
         # instead of blocking the caller (often the Qt main thread).
@@ -151,11 +182,19 @@ class AudioPrefetcher:
             except Exception:
                 log.warning("Could not cancel in-flight prefetch", exc_info=True)
 
-        thread.join(timeout=timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for thread in threads:
+            if deadline is None:
+                thread.join()
+            else:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
         with self._lock:
-            if self._thread is thread and not thread.is_alive():
+            if self._thread is primary and not any(
+                t.is_alive() for t in threads
+            ):
                 self._thread = None
+                self._extra_threads = []
                 self._stop_requested = False
                 return True
 
@@ -221,18 +260,21 @@ class AudioPrefetcher:
                 if delay <= 0:
                     break
                 if not logged:
-                    log.warning(
-                        "Edge TTS unavailable; pausing audio prefetch "
-                        "for up to %.0f s",
-                        delay,
-                    )
                     logged = True
-                with self._lock:
-                    self._paused = True
+                    with self._lock:
+                        self._edge_waiters += 1
+                        first = self._edge_waiters == 1
+                    if first:  # one line per pause, not one per worker
+                        log.warning(
+                            "Edge TTS unavailable; pausing audio prefetch "
+                            "for up to %.0f s",
+                            delay,
+                        )
                 self._stop_event.wait(min(delay, self.PAUSE_POLL_SECONDS))
         finally:
-            with self._lock:
-                self._paused = False
+            if logged:
+                with self._lock:
+                    self._edge_waiters -= 1
 
     def _process_if_accepting(self, text, config):
         key = self._key(text, config)
@@ -253,9 +295,12 @@ class AudioPrefetcher:
         key = self._key(text, config)
         ok = False
         error = None
+        ident = threading.get_ident()
         with self._lock:
-            self._current = " ".join(str(text).split())[:120]
-            self._current_started_at = time.monotonic()
+            self._in_flight[ident] = (
+                " ".join(str(text).split())[:120],
+                time.monotonic(),
+            )
         try:
             result = self.engine.prefetch(text, config)
             if result is None:
@@ -270,8 +315,7 @@ class AudioPrefetcher:
         finally:
             with self._lock:
                 self._queued_keys.discard(key)
-                self._current = None
-                self._current_started_at = None
+                self._in_flight.pop(ident, None)
                 if ok is None:
                     self._canceled += 1
                 elif ok:
@@ -315,13 +359,19 @@ class AudioPrefetcher:
             finally:
                 self._queue.task_done()
 
+    def _threads_locked(self):
+        if self._thread is None:
+            return []
+        return [self._thread, *self._extra_threads]
+
     def _finish_stopped_thread_locked(self):
         if (
             self._stop_requested
             and self._thread is not None
-            and not self._thread.is_alive()
+            and not any(t.is_alive() for t in self._threads_locked())
         ):
             self._thread = None
+            self._extra_threads = []
             self._accepting = False
             self._stop_requested = False
             self._discard_pending_locked()

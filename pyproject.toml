@@ -6,7 +6,7 @@ authors = [
     {name = "Lucas Paulo de Lima Camillo"}
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-    "edge-tts>=7.0.0",
+    "edge-tts>=7.3.1",
 ]

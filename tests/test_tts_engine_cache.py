@@ -1,10 +1,12 @@
 import sys
 import asyncio
+import re
 import socket
 import ssl
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -77,6 +79,66 @@ class OfflineEdgeTTS:
             )
 
 
+class _FakeHandshakeError(Exception):
+    """Mimics aiohttp.WSServerHandshakeError: a status and the full URL."""
+
+    def __init__(self, status):
+        super().__init__(
+            f"{status}, message='Invalid response status', "
+            "url='wss://speech.platform.bing.com/consumer/speech/synthesize/"
+            "readaloud/edge/v1?TrustedClientToken=SECRET-TOKEN'"
+        )
+        self.status = status
+
+
+class RejectedEdgeTTS:
+    calls = 0
+
+    class Communicate:
+        def __init__(self, text, voice, rate):
+            pass
+
+        async def save(self, path):
+            RejectedEdgeTTS.calls += 1
+            raise _FakeHandshakeError(403)
+
+
+class ThrottledEdgeTTS:
+    class Communicate:
+        def __init__(self, text, voice, rate):
+            pass
+
+        async def save(self, path):
+            raise _FakeHandshakeError(429)
+
+
+class TimingOutEdgeTTS:
+    class Communicate:
+        def __init__(self, text, voice, rate):
+            pass
+
+        async def save(self, path):
+            raise TimeoutError()
+
+
+class ServerDisconnectedError(Exception):
+    """Same name as aiohttp's: Edge dropped the connection mid-request."""
+
+
+class FlakyOnceEdgeTTS:
+    calls = 0
+
+    class Communicate:
+        def __init__(self, text, voice, rate):
+            pass
+
+        async def save(self, path):
+            FlakyOnceEdgeTTS.calls += 1
+            if FlakyOnceEdgeTTS.calls == 1:
+                raise ServerDisconnectedError("Server disconnected")
+            Path(path).write_bytes(FAKE_EDGE_BYTES)
+
+
 class HangingEdgeTTS:
     class Communicate:
         def __init__(self, text, voice, rate):
@@ -111,6 +173,8 @@ class BlockingStoreCache(AudioCache):
 class TTSEngineCacheTests(unittest.TestCase):
     def setUp(self):
         FakeEdgeTTS.saved_texts = []
+        RejectedEdgeTTS.calls = 0
+        FlakyOnceEdgeTTS.calls = 0
 
     def test_cache_hit_plays_existing_file_without_edge_generation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -209,6 +273,48 @@ class TTSEngineCacheTests(unittest.TestCase):
                 [int(4096 * engine.CLEANUP_TARGET_RATIO)],
             )
 
+    def test_live_cache_cleanup_runs_after_playback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = AudioCache(Path(tmpdir))
+            engine = TTSEngine(audio_cache=cache, cache_max_bytes=4096)
+            events = []
+            engine._get_edge_tts = lambda: FakeEdgeTTS
+            engine._play_file = (
+                lambda path, generation_id=None: events.append("play")
+            )
+            engine._cleanup_cache = lambda: events.append("cleanup")
+
+            engine._speak("hello", {"speed": 1.5, "fallback_to_system": True})
+
+            # The user hears the clip before eviction can stat the cache.
+            self.assertEqual(events, ["play", "cleanup"])
+
+    def test_live_wait_for_clip_being_prefetched_is_cancellable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = AudioCache(Path(tmpdir))
+            engine = TTSEngine(audio_cache=cache)
+            key = speech_cache_key("hello", engine.EDGE_VOICE, 1.5)
+            system_calls = []
+            engine._get_edge_tts = lambda: FakeEdgeTTS
+            engine._speak_system = (
+                lambda text, speed, generation_id=None:
+                system_calls.append(text)
+            )
+            lock = cache.generation_lock(key)
+            # The prefetch worker is generating this exact clip.
+            lock.acquire()
+            try:
+                engine.speak("hello", {"speed": 1.5, "fallback_to_system": True})
+                time.sleep(engine.GENERATION_LOCK_POLL_SECONDS)
+                engine.stop()
+
+                self.assertTrue(engine.wait_for_speech(timeout=1))
+            finally:
+                lock.release()
+            self.assertEqual(FakeEdgeTTS.saved_texts, [])
+            self.assertEqual(system_calls, [])
+            self.assertFalse(lock.locked())
+
     def test_play_cached_file_removes_temp_playback_file_after_playing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cached = Path(tmpdir) / "cached.mp3"
@@ -268,7 +374,25 @@ class TTSEngineCacheTests(unittest.TestCase):
             self.assertFalse(engine.edge_status()["open"])
             self.assertIn("Edge TTS failed", logs.output[0])
 
-    def test_repeated_edge_failures_trip_breaker_then_recover_after_cooldown(self):
+    def test_breaker_reports_outage_from_first_failure_of_the_streak(self):
+        wall = [5000.0]
+        breaker = _TTS_ENGINE_MODULE.EdgeCircuitBreaker(
+            clock=lambda: 0.0, wall_clock=lambda: wall[0]
+        )
+        # A success without a trip is not a recovery.
+        breaker.record_failure(TimeoutError())
+        self.assertIsNone(breaker.record_success())
+
+        wall[0] = 6000.0
+        for _ in range(breaker.THRESHOLD):
+            breaker.record_failure(TimeoutError())
+            wall[0] += 10
+        wall[0] = 7000.0
+
+        self.assertEqual(breaker.record_success(), (6000.0, 1000.0))
+        self.assertIsNone(breaker.record_success())
+
+    def test_repeated_edge_timeouts_trip_breaker_then_recover_after_cooldown(self):
         class Clock:
             value = 1000.0
 
@@ -285,7 +409,7 @@ class TTSEngineCacheTests(unittest.TestCase):
 
             def load_failing():
                 loads.append("failing")
-                return FailingEdgeTTS
+                return TimingOutEdgeTTS
 
             engine._get_edge_tts = load_failing
             engine._speak_system = lambda text, speed, generation_id=None: None
@@ -310,6 +434,40 @@ class TTSEngineCacheTests(unittest.TestCase):
             self.assertEqual(len(played), 1)
             self.assertFalse(engine.edge_status()["open"])
             self.assertEqual(engine.prefetch_pause_seconds(), 0)
+            self.assertEqual(
+                engine.live_stats()["fallbacks"],
+                {"request timed out": 3, "paused after timeouts": 1},
+            )
+
+    def test_fast_failure_trip_pauses_prefetch_but_live_still_tries_edge(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._get_edge_tts = lambda: RejectedEdgeTTS
+            engine._speak_system = lambda text, speed, generation_id=None: None
+            played = []
+            engine._play_file = (
+                lambda path, generation_id=None: played.append(path)
+            )
+
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING"):
+                for text in ("a", "b", "c"):
+                    self.assertFalse(engine.prefetch(text, {"speed": 1.5}))
+
+            self.assertTrue(engine.edge_status()["open"])
+            self.assertGreater(engine.prefetch_pause_seconds(), 0)
+            recovered = []
+            _TTS_ENGINE_MODULE.set_recovered_callback(
+                lambda started_at, seconds: recovered.append(True)
+            )
+            self.addCleanup(_TTS_ENGINE_MODULE.set_recovered_callback, None)
+            # Edge is back: the next live card must try it, not skip it.
+            engine._get_edge_tts = lambda: FakeEdgeTTS
+            engine._speak("d", {"speed": 1.5, "fallback_to_system": True})
+
+            self.assertEqual(FakeEdgeTTS.saved_texts, ["d"])
+            self.assertEqual(len(played), 1)
+            self.assertFalse(engine.edge_status()["open"])
+            self.assertEqual(recovered, [True])
 
     def test_prefetch_returns_none_while_breaker_is_open(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -526,6 +684,191 @@ class TTSEngineCacheTests(unittest.TestCase):
         self.assertEqual(
             _TTS_ENGINE_MODULE._edge_error_reason(cert), "TLS/certificate error"
         )
+
+    def test_http_403_reason_names_cause_without_url_or_token(self):
+        reason = _TTS_ENGINE_MODULE._edge_error_reason(_FakeHandshakeError(403))
+        self.assertIn("HTTP 403", reason)
+        self.assertIn("outdated", reason)
+        self.assertNotIn("TOKEN", reason)
+        wrapped = RuntimeError("stream failed")
+        wrapped.__cause__ = _FakeHandshakeError(503)
+        self.assertEqual(
+            _TTS_ENGINE_MODULE._edge_error_reason(wrapped),
+            "Edge service error (HTTP 503)",
+        )
+
+    def test_transient_errors_are_told_apart_from_outages(self):
+        transient = _TTS_ENGINE_MODULE._is_transient_edge_error
+        self.assertTrue(transient(ServerDisconnectedError("dropped")))
+        self.assertTrue(transient(_FakeHandshakeError(503)))
+        self.assertTrue(transient(TimeoutError()))
+        self.assertFalse(transient(_FakeHandshakeError(403)))
+        self.assertFalse(transient(_FakeClientConnectorError(
+            socket.gaierror(8, "nodename nor servname provided, or not known")
+        )))
+        self.assertFalse(transient(RuntimeError("cannot connect")))
+
+    def test_prefetch_403_fails_card_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._get_edge_tts = lambda: RejectedEdgeTTS
+
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING") as logs:
+                self.assertFalse(engine.prefetch("hello", {"speed": 1.5}))
+
+            self.assertIn("HTTP 403", engine.last_prefetch_error())
+            self.assertTrue(all(r.exc_info is None for r in logs.records))
+            self.assertNotIn("TOKEN", "\n".join(logs.output))
+
+    def test_prefetch_http_error_fails_card_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._get_edge_tts = lambda: ThrottledEdgeTTS
+
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING") as logs:
+                self.assertFalse(engine.prefetch("hello", {"speed": 1.5}))
+
+            self.assertIn("HTTP 429", engine.last_prefetch_error())
+            self.assertTrue(all(r.exc_info is None for r in logs.records))
+            self.assertNotIn("TOKEN", "\n".join(logs.output))
+            self.assertEqual(engine.edge_status()["consecutive_failures"], 1)
+
+    def test_403_trip_notifies_once_with_update_hint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._get_edge_tts = lambda: RejectedEdgeTTS
+            engine._breaker.PREFETCH_COOLDOWNS_SECONDS = (0, 0, 0)
+            messages = []
+            _TTS_ENGINE_MODULE.set_status_callback(messages.append)
+            self.addCleanup(_TTS_ENGINE_MODULE.set_status_callback, None)
+
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING"):
+                for text in ("a", "b", "c", "d", "e"):
+                    engine.prefetch(text, {"speed": 1.5})
+
+            self.assertGreaterEqual(engine.edge_status()["trips"], 2)
+            self.assertEqual(len(messages), 1)
+            self.assertIn("HTTP 403", messages[0])
+            self.assertIn("Update", messages[0])
+
+    def test_live_transient_failure_is_retried_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._get_edge_tts = lambda: FlakyOnceEdgeTTS
+            played = []
+            system_calls = []
+            engine._play_file = (
+                lambda path, generation_id=None: played.append(
+                    Path(path).read_bytes()
+                )
+            )
+            engine._speak_system = (
+                lambda text, speed, generation_id=None:
+                system_calls.append(text)
+            )
+
+            engine._speak("hello", {"speed": 1.5, "fallback_to_system": True})
+
+            self.assertEqual(FlakyOnceEdgeTTS.calls, 2)
+            self.assertEqual(played, [FAKE_EDGE_BYTES])
+            self.assertEqual(system_calls, [])
+            self.assertEqual(engine.edge_status()["consecutive_failures"], 0)
+
+    def test_live_403_is_not_retried_and_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            engine._get_edge_tts = lambda: RejectedEdgeTTS
+            system_calls = []
+            engine._speak_system = (
+                lambda text, speed, generation_id=None:
+                system_calls.append(text)
+            )
+
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING"):
+                engine._speak("hello", {"speed": 1.5, "fallback_to_system": True})
+
+            self.assertEqual(RejectedEdgeTTS.calls, 1)
+            self.assertEqual(system_calls, ["hello"])
+            self.assertEqual(engine.edge_status()["consecutive_failures"], 1)
+            self.assertEqual(
+                sum(engine.live_stats()["fallbacks"].values()), 1
+            )
+
+    def test_live_request_uses_shorter_timeout_than_prefetch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = TTSEngine(audio_cache=AudioCache(Path(tmpdir)))
+            self.addCleanup(engine.shutdown)
+            engine.EDGE_LIVE_TIMEOUT_SECONDS = 0.01
+            engine._get_edge_tts = lambda: HangingEdgeTTS
+            system_calls = []
+            engine._speak_system = (
+                lambda text, speed, generation_id=None:
+                system_calls.append(text)
+            )
+
+            started = time.monotonic()
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="WARNING"):
+                engine._speak("hello", {"speed": 1.5, "fallback_to_system": True})
+
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(system_calls, ["hello"])
+            self.assertGreater(
+                engine.EDGE_REQUEST_TIMEOUT_SECONDS,
+                TTSEngine.EDGE_LIVE_TIMEOUT_SECONDS,
+            )
+
+    def test_outdated_edge_tts_import_warns_and_reports_version(self):
+        old = types.ModuleType("edge_tts")
+        old.__version__ = "7.2.8"
+        old.__version_info__ = (7, 2, 8)
+        saved = sys.modules.get("edge_tts")
+        sys.modules["edge_tts"] = old
+        try:
+            with self.assertLogs(_TTS_ENGINE_MODULE.log, level="INFO") as logs:
+                engine = TTSEngine()
+                self.assertIs(engine._get_edge_tts(), old)
+        finally:
+            if saved is None:
+                sys.modules.pop("edge_tts", None)
+            else:
+                sys.modules["edge_tts"] = saved
+
+        self.assertTrue(any("7.2.8 loaded" in line for line in logs.output))
+        self.assertTrue(any(
+            "older than 7.3.1" in line and "REFRESH_VENDOR" in line
+            for line in logs.output
+        ))
+        self.assertEqual(engine.edge_status()["version"], "7.2.8")
+
+    def test_bundled_edge_tts_version_is_read_without_import(self):
+        original = _TTS_ENGINE_MODULE._addon_dir
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                _TTS_ENGINE_MODULE._addon_dir = lambda: tmpdir
+                self.assertIsNone(_TTS_ENGINE_MODULE.bundled_edge_tts_version())
+                version_py = Path(tmpdir, "vendor", "edge_tts", "version.py")
+                version_py.parent.mkdir(parents=True)
+                version_py.write_text('__version__ = "7.3.1"\n')
+                self.assertEqual(
+                    _TTS_ENGINE_MODULE.bundled_edge_tts_version(), "7.3.1"
+                )
+            finally:
+                _TTS_ENGINE_MODULE._addon_dir = original
+
+    def test_build_script_min_edge_tts_version_matches_runtime_check(self):
+        script = (
+            Path(__file__).resolve().parent.parent / "build_addon.sh"
+        ).read_text()
+        match = re.search(
+            r'EDGE_TTS_MIN_VERSION="\$\{EDGE_TTS_MIN_VERSION:-([0-9.]+)\}"',
+            script,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            match.group(1),
+            ".".join(str(p) for p in _TTS_ENGINE_MODULE.EDGE_TTS_MIN_VERSION),
+        )
+        self.assertIn('"edge-tts>=${EDGE_TTS_MIN_VERSION}"', script)
 
     def test_empty_timeout_reason_is_not_blank(self):
         self.assertEqual(
@@ -995,7 +1338,9 @@ class TTSEngineCacheTests(unittest.TestCase):
             engine._speak("hit", {"speed": 1.5})
             engine._speak("miss", {"speed": 1.5})
 
-            self.assertEqual(engine.live_stats(), {"hits": 1, "misses": 1})
+            self.assertEqual(
+                engine.live_stats(), {"hits": 1, "misses": 1, "fallbacks": {}}
+            )
 
     def test_run_process_kills_player_on_timeout_and_clears_process(self):
         engine = TTSEngine()

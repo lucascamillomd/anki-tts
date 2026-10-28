@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
 import uuid
@@ -45,6 +46,9 @@ class AudioCache:
         # never has to scan the directory. None until first computed.
         self._size_lock = threading.Lock()
         self._total_bytes = None
+        # One eviction at a time: two overlapping ones each work from their
+        # own directory snapshot and together evict far below the target.
+        self._cleanup_lock = threading.Lock()
 
     def path_for_key(self, key):
         return self.root / f"{key}.mp3"
@@ -151,17 +155,25 @@ class AudioCache:
             self._total_bytes = None
 
     def cleanup_if_needed(self, max_bytes, target_bytes=None):
-        """Evict old files only when the tracked total exceeds max_bytes."""
+        """Evict old files only when the tracked total exceeds max_bytes.
+
+        Skips when another thread is already evicting: that cleanup brings
+        the cache under the limit. The total is re-checked under the lock in
+        case a cleanup finished between the first check and acquiring it.
+        """
         if self.total_bytes() <= max_bytes:
             return 0
-        return self.cleanup(
-            max_bytes if target_bytes is None else min(target_bytes, max_bytes)
-        )
-
-    def iter_audio_files(self):
-        for path in self.root.glob("*.mp3"):
-            if path.is_file():
-                yield path
+        if not self._cleanup_lock.acquire(blocking=False):
+            return 0
+        try:
+            if self.total_bytes() <= max_bytes:
+                return 0
+            return self.cleanup(
+                max_bytes if target_bytes is None
+                else min(target_bytes, max_bytes)
+            )
+        finally:
+            self._cleanup_lock.release()
 
     def cleanup_temp_files(self, min_age_seconds=0):
         """Remove leftover *.tmp files.
@@ -191,15 +203,20 @@ class AudioCache:
         return removed
 
     def cleanup(self, max_bytes):
+        """Evict the oldest clips until the cache is at most max_bytes.
+
+        Not serialized itself: concurrent callers go through
+        cleanup_if_needed, which allows one eviction at a time.
+        """
         entries = []
         total_bytes = 0
         for entry in self._scan_audio_entries():
             try:
-                stat = entry.stat()
+                st = entry.stat()
             except OSError:
                 continue
-            entries.append((stat.st_mtime, entry.path, stat.st_size))
-            total_bytes += stat.st_size
+            entries.append((st.st_mtime, entry.path, st.st_size))
+            total_bytes += st.st_size
 
         removed = 0
         for _, path, size in sorted(entries):
@@ -208,7 +225,8 @@ class AudioCache:
             try:
                 os.unlink(path)
             except FileNotFoundError:
-                pass
+                # Already gone (e.g. remove()): it no longer counts either.
+                total_bytes -= size
             else:
                 total_bytes -= size
                 removed += 1
@@ -242,7 +260,9 @@ class AudioCache:
 
     @staticmethod
     def _is_valid_audio_file(path):
+        # One stat call: this runs on every live cache lookup.
         try:
-            return path.is_file() and path.stat().st_size >= MIN_AUDIO_BYTES
-        except FileNotFoundError:
+            st = os.stat(path)
+        except OSError:
             return False
+        return stat.S_ISREG(st.st_mode) and st.st_size >= MIN_AUDIO_BYTES

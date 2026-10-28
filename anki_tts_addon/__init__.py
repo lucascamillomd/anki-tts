@@ -42,7 +42,12 @@ from .card_text import (
     speakable_question_text,
 )
 from .monitor_model import WarmStats, build_snapshot
-from .tts_engine import TTSEngine, set_status_callback
+from .tts_engine import (
+    TTSEngine,
+    bundled_edge_tts_version,
+    set_recovered_callback,
+    set_status_callback,
+)
 from .review_html_cache import (
     REVIEW_ANSWER_CONTEXT,
     REVIEW_QUESTION_CONTEXT,
@@ -76,20 +81,30 @@ CLEAR_AUDIO_CACHE_STOP_TIMEOUT_SECONDS = 1.0
 # Profile close runs on the Qt main thread: keep each wait tiny. In-flight
 # requests are cancelled first, so workers exit almost immediately.
 CLOSE_STOP_TIMEOUT_SECONDS = 0.1
+# Concurrent background Edge requests: each is ~1 s of network wait, so two
+# halve a full regeneration. Kept low so Microsoft does not throttle us.
+PREFETCH_WORKERS = 2
 AUTO_WARM_START_DELAY_MS = 5000
 AUTO_WARM_SYNC_DELAY_MS = 1000
 # Only temp files older than this are stale leftovers from a previous run.
 TEMP_FILE_MIN_AGE_SECONDS = 300
 ALL_CARDS_SEARCH = ""
+DUE_CARDS_SEARCH = "is:due"
 # Bump when question-text extraction changes so the next warm-up rescans
 # every card instead of trusting the incremental watermark.
 WARM_TEXT_VERSION = 3
 # Backlog cards (audio still missing at the last scan) rendered per scan. The
-# worker makes ~1 clip/s, so larger slices would only re-render cards that
-# can't be generated before the next scan anyway. The rest carries over and
-# the next slice is scanned when the worker drains.
+# worker makes ~1 clip/s per request slot, so larger slices would only
+# re-render cards that can't be generated before the next scan anyway. The
+# rest carries over and the next slice is scanned when the worker drains.
 BACKLOG_SCAN_CARDS = 1000
 BACKLOG_REFILL_DELAY_MS = 2000
+# When Edge recovers mid-session, clips that failed during the outage are
+# retried at once instead of at the next launch or sync, at most this often.
+# Shorter outages (a flaky network) are left to the per-clip backoff: they
+# fail few clips, and retrying them would rewind the backlog walk each time.
+EDGE_RECOVERY_RETRY_MIN_INTERVAL_SECONDS = 600
+EDGE_RECOVERY_MIN_OUTAGE_SECONDS = 600
 # Background scan chunking (see _scan_step): cards per collection op, a
 # time cap per op, and the pause between ops.
 SCAN_CHUNK_CARDS = 200
@@ -105,6 +120,8 @@ _audio_cache_state: Optional[AudioCacheState] = None
 _profile_generation = 0
 _shutting_down = False
 _sync_in_progress = False
+_last_recovery_retry_at: Optional[float] = None
+_edge_version_checked = False
 
 # Monitor state. WarmStats is the only object the worker/scan threads share
 # with the UI; the monitor timer never reads config or touches the disk.
@@ -172,8 +189,7 @@ def audio_cache_state() -> AudioCacheState:
     return _audio_cache_state
 
 
-def _cache_enabled(conf: Optional[dict] = None) -> bool:
-    conf = conf if conf is not None else get_config()
+def _cache_enabled(conf: dict) -> bool:
     return conf.get("cache_enabled", True)
 
 
@@ -226,10 +242,23 @@ def _stop_prefetcher(timeout=None) -> bool:
     return True
 
 
+def _drain_audio_generation(timeout: float) -> bool:
+    """Stop speech and the worker; True once nothing is generating audio."""
+    if _engine is not None:
+        _engine.stop()
+    if not _stop_prefetcher(timeout=timeout):
+        return False
+    if _engine is not None and hasattr(_engine, "wait_for_speech"):
+        return _engine.wait_for_speech(timeout=timeout)
+    return True
+
+
 def prefetcher() -> AudioPrefetcher:
     global _prefetcher
     if _prefetcher is None:
         _prefetcher = AudioPrefetcher(engine())
+        if hasattr(_prefetcher, "set_workers"):
+            _prefetcher.set_workers(PREFETCH_WORKERS)
         if _user_paused and hasattr(_prefetcher, "pause"):
             _prefetcher.pause()
         if hasattr(_prefetcher, "set_idle_callback"):
@@ -272,12 +301,7 @@ def engine() -> TTSEngine:
         _engine_cache_enabled is not None
         and _engine_cache_enabled != cache_enabled
     ):
-        _engine.stop()
-        drained = _stop_prefetcher(timeout=PREFETCH_STOP_TIMEOUT_SECONDS)
-        if drained and hasattr(_engine, "wait_for_speech"):
-            drained = _engine.wait_for_speech(
-                timeout=PREFETCH_STOP_TIMEOUT_SECONDS
-            )
+        drained = _drain_audio_generation(PREFETCH_STOP_TIMEOUT_SECONDS)
         if drained:
             old_engine = _engine
             _engine = TTSEngine(
@@ -629,7 +653,14 @@ def _changed_notetype_ids(since: dict, current: Optional[dict]) -> list:
 
 def _select_card_ids(col, since: Optional[dict], notetype_ids=()) -> list:
     if since is None:
-        return list(col.find_cards(ALL_CARDS_SEARCH))
+        # Today's due cards first, so after a mass regeneration the clips
+        # needed in this session are not hours down the queue.
+        try:
+            due = list(col.find_cards(DUE_CARDS_SEARCH))
+        except Exception:
+            log.debug("Could not search due cards", exc_info=True)
+            due = []
+        return list(dict.fromkeys(due + list(col.find_cards(ALL_CARDS_SEARCH))))
     # Local edits bump mod (seconds); synced-in changes carry a server usn
     # above anything seen at the last scan. Unsynced rows (usn -1) are NOT
     # selected by usn: for a collection that never syncs every row is -1,
@@ -798,14 +829,6 @@ def _scan_step(col, scan, conf, cancel_event) -> dict:
     return scan
 
 
-def _scan_collection_for_audio(col, since, conf, cache, cancel_event) -> dict:
-    """Whole scan in one call (tools/tests); the add-on itself uses chunks."""
-    scan = _scan_begin(col, since, conf, cache, cancel_event)
-    while not scan["result"]["aborted"] and not scan["done"]:
-        _scan_step(col, scan, conf, cancel_event)
-    return scan["result"]
-
-
 def _query_op_class():
     try:
         from aqt.operations import QueryOp
@@ -940,6 +963,10 @@ def _start_warm_job(full: bool = False, manual: bool = False) -> bool:
             )
         return False
 
+    try:
+        _retry_failures_after_edge_tts_update()
+    except Exception:
+        log.warning("Could not check the bundled edge-tts version", exc_info=True)
     since = None if full else _load_watermark(collection, conf)
     cache = audio_cache()
     job = {
@@ -977,7 +1004,6 @@ def _on_warm_scan_failed(job: dict, error) -> None:
             log.debug("Cancelled TTS audio scan ended with: %s", error)
             return
         log.warning("TTS audio warm-up scan failed: %s", error)
-        _record_last_error(f"scan failed: {error}")
         _warm_stats.record_error(f"card scan failed: {error}")
         if job["manual"]:
             _show_tooltip(f"TTS audio scan failed: {error}")
@@ -1042,12 +1068,9 @@ def _on_warm_scan_done(job: dict, result: dict) -> None:
 
         job["queued"] = queued
         job["completed"] = True
-        with _stats_lock:
-            if _scan_stats["last_scan"] is not None:
-                _scan_stats["last_scan"]["queued"] = queued
     except Exception:
         log.exception("TTS audio warm-up failed")
-        _record_last_error("warm-up failed")
+        _warm_stats.record_error("audio warm-up failed")
     finally:
         _finish_warm_job(job)
 
@@ -1156,13 +1179,6 @@ def on_sync_did_finish():
 # Worker callbacks (called from the prefetch thread)
 # ---------------------------------------------------------------------------
 
-def _record_last_error(message: str) -> None:
-    with _stats_lock:
-        last = dict(_scan_stats.get("last_scan") or {})
-        last["error"] = message
-        _scan_stats["last_scan"] = last
-
-
 def _record_scan_stats(result: dict) -> None:
     now = int(time.time())
     missing_keys = set(result["missing"])
@@ -1179,7 +1195,6 @@ def _record_scan_stats(result: dict) -> None:
             "cards": result["cards"],
             "speakable": result["total"],
             "missing": len(missing_keys),
-            "queued": 0,
             "errors": result["errors"],
         }
         total = _scan_stats["total"]
@@ -1406,24 +1421,11 @@ def _reset_scan_stats() -> None:
 def clear_audio_cache():
     """Stop background audio generation and remove cached TTS audio files."""
     _cancel_running_warm_job()
-    if _engine is not None:
-        _engine.stop()
-    if not _stop_prefetcher(timeout=CLEAR_AUDIO_CACHE_STOP_TIMEOUT_SECONDS):
+    if not _drain_audio_generation(CLEAR_AUDIO_CACHE_STOP_TIMEOUT_SECONDS):
         tooltip(
             "Skipped clearing TTS audio cache because audio generation is still in progress"
         )
         return
-    if _engine is not None:
-        if (
-            hasattr(_engine, "wait_for_speech")
-            and not _engine.wait_for_speech(
-                timeout=CLEAR_AUDIO_CACHE_STOP_TIMEOUT_SECONDS
-            )
-        ):
-            tooltip(
-                "Skipped clearing TTS audio cache because audio generation is still in progress"
-            )
-            return
 
     cache = audio_cache()
     _reset_scan_stats()
@@ -1437,15 +1439,7 @@ def clear_audio_cache():
 
 
 def _remove_cached_audio_files(cache) -> int:
-    removed = 0
-    for path in list(cache.iter_audio_files()):
-        try:
-            path.unlink()
-        except OSError:
-            continue
-        removed += 1
-    if hasattr(cache, "invalidate_size"):
-        cache.invalidate_size()
+    removed = cache.remove_all_audio_files()
     if hasattr(cache, "total_bytes"):
         cache.total_bytes()  # re-measure off the UI thread
     return removed
@@ -1516,17 +1510,14 @@ def monitor_snapshot():
     cache_bytes = None
     if cache is not None and hasattr(cache, "known_total_bytes"):
         cache_bytes = cache.known_total_bytes()
-    worker = _prefetcher
-    user_paused = _user_paused
-    if worker is not None and hasattr(worker, "is_paused"):
-        user_paused = user_paused or worker.is_paused()
+    # build_snapshot also ORs in the worker's own user_paused from status().
     return build_snapshot(
         audio_cache_status_snapshot(),
         _warm_stats.snapshot(),
         enabled=_monitor_conf["enabled"],
         cache_enabled=_monitor_conf["cache_enabled"],
         prefetch_enabled=_monitor_conf["prefetch_enabled"],
-        user_paused=user_paused,
+        user_paused=_user_paused,
         cache_bytes=cache_bytes,
         cache_limit_bytes=_monitor_conf["cache_limit_bytes"],
     )
@@ -1560,6 +1551,72 @@ def retry_failed_audio_cache():
         return
     _rewind_backlog()
     _start_warm_job(full=full, manual=True)
+
+
+def _retry_failures_after_edge_tts_update() -> None:
+    """Once per profile: after an edge-tts update, retry every failed clip.
+
+    Clips that failed with an outdated edge-tts (e.g. HTTP 403) would
+    otherwise wait out their backoff; the first scan re-queues them all.
+    """
+    global _edge_version_checked
+    if _edge_version_checked:
+        return
+    _edge_version_checked = True
+    version = bundled_edge_tts_version()
+    if version is None:
+        return
+    state = audio_cache_state()
+    if state.get_meta("edge_tts_version") == version:
+        return
+    count = state.retry_failures_now()
+    if count:
+        log.info(
+            "edge-tts %s bundled; retrying %d failed TTS clips", version, count
+        )
+        _rewind_backlog()
+    state.set_meta("edge_tts_version", version)
+
+
+def _on_edge_recovered(outage_started_at: float, outage_seconds: float) -> None:
+    """Engine thread: Edge works again after an outage."""
+    if _shutting_down or outage_seconds < EDGE_RECOVERY_MIN_OUTAGE_SECONDS:
+        return
+    try:
+        mw.taskman.run_on_main(
+            lambda: _on_edge_recovered_main(outage_started_at)
+        )
+    except Exception:
+        log.debug("Could not schedule TTS recovery retry", exc_info=True)
+
+
+def _on_edge_recovered_main(outage_started_at: float) -> None:
+    """Retry clips that failed during the outage without waiting for a restart.
+
+    Only failures recorded since the outage began lose their backoff; older
+    failures keep it. Runs via run_on_main, so errors are logged, not raised.
+    """
+    global _last_recovery_retry_at
+    try:
+        state = _audio_cache_state
+        if _shutting_down or state is None:
+            return
+        now = time.monotonic()
+        if (
+            _last_recovery_retry_at is not None
+            and now - _last_recovery_retry_at
+            < EDGE_RECOVERY_RETRY_MIN_INTERVAL_SECONDS
+        ):
+            return
+        count = state.retry_failures_now(failed_since=outage_started_at)
+        if not count:
+            return
+        _last_recovery_retry_at = now
+        log.info("Edge TTS recovered; retrying %d failed TTS clips", count)
+        _rewind_backlog()
+        _schedule_auto_warm_all_audio_cache(BACKLOG_REFILL_DELAY_MS)
+    except Exception:
+        log.warning("TTS recovery retry failed", exc_info=True)
 
 
 def _rewind_backlog() -> None:
@@ -1727,6 +1784,7 @@ def _shutdown_background_work() -> None:
 
 def _shutdown_steps() -> None:
     set_status_callback(None)
+    set_recovered_callback(None)
     _safely(_cancel_scheduled_auto_warm, "cancel scheduled scan")
     _safely(_cancel_running_warm_job, "cancel scan")
 
@@ -1769,10 +1827,13 @@ def _stop_prefetcher_for_close() -> None:
 
 def _on_profile_did_open():
     global _menu_added, _hooks_registered, _shutting_down, _sync_in_progress
+    global _edge_version_checked
     _advance_profile_generation()
     _shutting_down = False
     _sync_in_progress = False
+    _edge_version_checked = False
     set_status_callback(_show_status)
+    set_recovered_callback(_on_edge_recovered)
     _register_quit_hook()
     try:
         addon_log.setup(__name__, _addon_user_files_dir())
@@ -1783,12 +1844,16 @@ def _on_profile_did_open():
     if _cache_enabled(conf):
         # Globbing a 30k-file cache directory must not delay profile open.
         cache = audio_cache()
+
+        def _prepare_cache():
+            cache.cleanup_temp_files(min_age_seconds=TEMP_FILE_MIN_AGE_SECONDS)
+            if hasattr(cache, "total_bytes"):
+                # Measure once here, so the first live clip's cleanup check
+                # never has to stat the whole cache before playing.
+                cache.total_bytes()
+
         try:
-            _run_in_background(
-                lambda: cache.cleanup_temp_files(
-                    min_age_seconds=TEMP_FILE_MIN_AGE_SECONDS
-                )
-            )
+            _run_in_background(_prepare_cache)
         except Exception:
             log.debug("Could not clean TTS temp files", exc_info=True)
     _schedule_auto_warm_all_audio_cache(AUTO_WARM_START_DELAY_MS)
@@ -1797,30 +1862,19 @@ def _on_profile_did_open():
     if not _menu_added:
         menu = QMenu("Anki TTS", mw)
 
-        toggle_action = QAction("Toggle TTS", mw)
-        toggle_action.setShortcut("Ctrl+Shift+T")
-        toggle_action.triggered.connect(toggle_tts)
-        menu.addAction(toggle_action)
-
-        settings_action = QAction("Settings...", mw)
-        settings_action.triggered.connect(lambda: SettingsDialog(mw).exec())
-        menu.addAction(settings_action)
-
-        warm_cache_action = QAction("Warm All Audio Cache", mw)
-        warm_cache_action.triggered.connect(warm_all_audio_cache)
-        menu.addAction(warm_cache_action)
-
-        status_action = QAction("Audio Cache Status", mw)
-        status_action.triggered.connect(show_audio_cache_status)
-        menu.addAction(status_action)
-
-        monitor_action = QAction("Show Monitor", mw)
-        monitor_action.triggered.connect(show_monitor)
-        menu.addAction(monitor_action)
-
-        clear_cache_action = QAction("Clear Audio Cache", mw)
-        clear_cache_action.triggered.connect(confirm_clear_audio_cache)
-        menu.addAction(clear_cache_action)
+        for label, callback, shortcut in (
+            ("Toggle TTS", toggle_tts, "Ctrl+Shift+T"),
+            ("Settings...", lambda: SettingsDialog(mw).exec(), None),
+            ("Warm All Audio Cache", warm_all_audio_cache, None),
+            ("Audio Cache Status", show_audio_cache_status, None),
+            ("Show Monitor", show_monitor, None),
+            ("Clear Audio Cache", confirm_clear_audio_cache, None),
+        ):
+            action = QAction(label, mw)
+            if shortcut:
+                action.setShortcut(shortcut)
+            action.triggered.connect(callback)
+            menu.addAction(action)
 
         mw.form.menubar.addMenu(menu)
         _menu_added = True

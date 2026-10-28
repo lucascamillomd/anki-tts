@@ -36,6 +36,14 @@ class AudioCacheTests(unittest.TestCase):
             self.assertEqual(cache.total_bytes(), MIN_AUDIO_BYTES)
             self.assertEqual(cache.known_total_bytes(), MIN_AUDIO_BYTES)
 
+    def test_get_ignores_directory_named_like_a_clip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = AudioCache(Path(tmpdir))
+            cache.path_for_key("abc").mkdir()
+
+            self.assertIsNone(cache.get("abc"))
+            self.assertFalse(cache.has("abc"))
+
     def test_remove_all_audio_files_keeps_other_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -155,20 +163,6 @@ class AudioCacheTests(unittest.TestCase):
 
             self.assertFalse(path.exists())
 
-    def test_iter_audio_files_yields_only_mp3_files(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            cache = AudioCache(root)
-            (root / "first.mp3").write_bytes(_valid_audio_bytes(b"a"))
-            (root / "second.mp3").write_bytes(_valid_audio_bytes(b"b"))
-            (root / "ignored.tmp").write_bytes(_valid_audio_bytes(b"c"))
-            (root / "directory.mp3").mkdir()
-
-            self.assertEqual(
-                sorted(path.name for path in cache.iter_audio_files()),
-                ["first.mp3", "second.mp3"],
-            )
-
     def test_cleanup_temp_files_removes_only_tmp_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -280,6 +274,76 @@ class AudioCacheTests(unittest.TestCase):
 
             cache.cleanup_if_needed(MIN_AUDIO_BYTES - 1, target_bytes=10)
             self.assertEqual(calls, [10])
+
+    def test_cleanup_if_needed_skips_while_another_cleanup_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            for name in ("a", "b", "c"):
+                (root / f"{name}.mp3").write_bytes(b"x" * MIN_AUDIO_BYTES)
+            cache.total_bytes()
+
+            with cache._cleanup_lock:
+                removed = cache.cleanup_if_needed(MIN_AUDIO_BYTES)
+
+            self.assertEqual(removed, 0)
+            self.assertEqual(len(cache.cached_keys()), 3)
+
+    def test_cleanup_if_needed_rechecks_total_after_taking_the_lock(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            for name in ("a", "b", "c"):
+                (root / f"{name}.mp3").write_bytes(b"x" * MIN_AUDIO_BYTES)
+            cache.total_bytes()
+            # Another cleanup finishes between the first check and the lock.
+            real_lock = cache._cleanup_lock
+            cache_ref = cache
+
+            class FinishingLock:
+                def acquire(self, blocking=True):
+                    acquired = real_lock.acquire(blocking)
+                    cache_ref.cleanup(MIN_AUDIO_BYTES)
+                    return acquired
+
+                def release(self):
+                    real_lock.release()
+
+            cache._cleanup_lock = FinishingLock()
+            removed = cache.cleanup_if_needed(MIN_AUDIO_BYTES * 2)
+
+            self.assertEqual(removed, 0)
+            self.assertEqual(len(cache.cached_keys()), 1)
+
+    def test_cleanup_counts_files_deleted_by_someone_else(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AudioCache(root)
+            old = root / "old.mp3"
+            middle = root / "middle.mp3"
+            newest = root / "newest.mp3"
+            for path in (old, middle, newest):
+                path.write_bytes(b"x" * MIN_AUDIO_BYTES)
+            os.utime(old, (100, 100))
+            os.utime(middle, (200, 200))
+            os.utime(newest, (300, 300))
+            real_unlink = os.unlink
+
+            def unlink(path, *args, **kwargs):
+                if str(path) == str(old):
+                    real_unlink(path)
+                    raise FileNotFoundError(path)
+                return real_unlink(path, *args, **kwargs)
+
+            os.unlink = unlink
+            try:
+                cache.cleanup(MIN_AUDIO_BYTES)
+            finally:
+                os.unlink = real_unlink
+
+            self.assertFalse(middle.exists())
+            self.assertTrue(newest.exists())
+            self.assertEqual(cache.total_bytes(), MIN_AUDIO_BYTES)
 
     def test_cleanup_updates_tracked_total(self):
         with tempfile.TemporaryDirectory() as tmpdir:

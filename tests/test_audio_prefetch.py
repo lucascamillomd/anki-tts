@@ -752,6 +752,75 @@ class AudioPrefetcherTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertIsNone(prefetcher.status()["current_started_at"])
 
+    def test_workers_process_items_concurrently_and_stop_joins_all(self):
+        class CountingEngine(FakeEngine):
+            def __init__(self):
+                super().__init__()
+                self.lock = threading.Lock()
+                self.both_active = threading.Event()
+                self.release = threading.Event()
+                self.active = 0
+
+            def prefetch(self, text, config):
+                with self.lock:
+                    self.calls.append((text, dict(config)))
+                    self.active += 1
+                    if self.active == 2:
+                        self.both_active.set()
+                try:
+                    self.release.wait(timeout=10)
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        engine = CountingEngine()
+        prefetcher = AudioPrefetcher(engine)
+        prefetcher.set_workers(2)
+        self.addCleanup(engine.release.set)
+        prefetcher.start()
+        prefetcher.enqueue("first", {"speed": 1.5})
+        prefetcher.enqueue("second", {"speed": 1.5})
+
+        self.assertTrue(engine.both_active.wait(timeout=2))
+        status = prefetcher.status()
+        self.assertEqual(status["active"], 2)
+        self.assertIn(status["current"], ("first", "second"))
+
+        threads = [prefetcher._thread, *prefetcher._extra_threads]
+        self.assertEqual(len(threads), 2)
+        engine.release.set()
+        self.assertTrue(prefetcher.stop(timeout=2))
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(prefetcher.status()["alive"])
+
+    def test_timed_stop_with_workers_waits_for_every_thread(self):
+        engine = BlockingEngine()
+        prefetcher = AudioPrefetcher(engine)
+        prefetcher.set_workers(2)
+        self.addCleanup(engine.release.set)
+        prefetcher.start()
+        prefetcher.enqueue("slow", {"speed": 1.5})
+        self.assertTrue(engine.entered.wait(timeout=2))
+
+        # The idle worker exits at once; the busy one is still in a request.
+        self.assertFalse(prefetcher.stop(timeout=0.05))
+        self.assertFalse(prefetcher.start())
+
+        engine.release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and prefetcher.status()["alive"]:
+            time.sleep(0.01)
+        self.assertTrue(prefetcher.start())
+        self.assertEqual(len(prefetcher._extra_threads), 1)
+        self.assertTrue(prefetcher.stop(timeout=2))
+
+    def test_set_workers_is_clamped(self):
+        prefetcher = AudioPrefetcher(FakeEngine())
+        prefetcher.set_workers(0)
+        self.assertEqual(prefetcher._workers, 1)
+        prefetcher.set_workers(99)
+        self.assertEqual(prefetcher._workers, AudioPrefetcher.MAX_WORKERS)
+
     def test_failure_uses_engine_reason_instead_of_generic_message(self):
         class ReasonEngine(FakeEngine):
             def prefetch(self, text, config):

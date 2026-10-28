@@ -11,6 +11,8 @@ The add-on uses a two-tier TTS fallback system:
 
 When you review a card, the add-on automatically reads the question aloud. Edge TTS audio is cached on disk after it is generated, so repeated cards can start speaking immediately without waiting on the network. On profile open and after collection sync, the add-on delays automatic warming and then queues missing question audio in small batches so Anki can finish opening and remain responsive. If Edge TTS is unavailable for uncached text (no internet, service down), it falls back to your system voice.
 
+For uncached text during review, a quick transient Edge error (dropped connection, HTTP 429/5xx) is retried once before falling back, and a live request gives up after 10 seconds (background generation allows 30). Repeated background failures pause background generation, but review keeps trying Edge for each card unless the failures were timeouts, so speech switches back to Edge as soon as it works again. When Edge recovers from an outage of 10 minutes or more mid-session, clips that failed during that outage are retried right away (at most every 10 minutes) instead of at the next launch or sync; older failures and short blips keep their normal retry backoff. If Microsoft rejects the bundled `edge-tts` client (HTTP 403, as happens when its protocol changes), the add-on says so once and asks you to update the add-on.
+
 ## Installation
 
 1. Build `anki_tts.ankiaddon` locally (see below).
@@ -50,14 +52,14 @@ Click the icon (or use **Anki TTS → Show Monitor** when the toolbar is hidden,
 - pending/active queue size, clips awaiting retry, and scan progress (`full: 12,400/30,120 cards`)
 - the clip being generated right now and how long it has been running
 - generation rate, ETA, and this session's generated/failed counts
-- disk usage against the cache size limit (measured once in the background when the panel first opens, then tracked incrementally)
+- disk usage against the cache size limit (measured once in the background when the profile opens, then tracked incrementally)
 - Edge TTS status, including the reason and retry time when the add-on has backed off after repeated network errors
 - how many clips played during review came straight from the cache
 - the last 50 errors with their real cause (for example `request timed out`) and the start of the card text
 
 Buttons:
 
-- **Pause / Resume** — hold background generation after the current clip (for this Anki session only; it is not saved). Quitting Anki is never blocked by a paused worker.
+- **Pause / Resume** — hold background generation after the clips in progress (for this Anki session only; it is not saved). Quitting Anki is never blocked by a paused worker.
 - **Warm all** — rescan every card and queue missing audio.
 - **Retry failed** — clear the retry backoff and walk the backlog from its first card, 1,000 cards at a time, so every failed clip is retried in one pass (runs a full card rescan only if old failures from a previous version have no stored text).
 - **Clear cache...** — delete all cached audio after confirmation; files are removed in the background.
@@ -97,7 +99,7 @@ The add-on intelligently handles card content:
 
 Anki TTS caches generated Edge TTS MP3 files under the add-on's `user_files/audio_cache/` directory. Anki preserves `user_files/` when the add-on is upgraded, so generated audio survives reinstalling the package.
 
-During review, the add-on plays cached audio immediately when available. If audio is missing, it generates the file with Edge TTS, stores it, and then plays it. The **Anki TTS -> Warm All Audio Cache** menu action queues every card for background generation. Existing cache files are skipped, so this is mainly work for new or changed card text. When a warm-all pass drains, the add-on reports whether the cache is complete or how many cards are still missing audio.
+During review, the add-on plays cached audio immediately when available. If audio is missing, it generates the file with Edge TTS, stores it, and then plays it; old clips are evicted (when the cache is over its size limit) only after playback. The **Anki TTS -> Warm All Audio Cache** menu action queues every card for background generation, cards due today first. The background worker runs two Edge requests at a time. Existing cache files are skipped, so this is mainly work for new or changed card text. When a warm-all pass drains, the add-on reports whether the cache is complete or how many cards are still missing audio.
 
 Each scan saves a watermark as soon as it completes, together with a compact backlog of cards whose audio is still missing. Startup and sync then scan only changed cards plus the next 1,000 backlog cards (continuing where the last scan stopped), and the next slice is scanned whenever the worker runs out of work, so quitting mid-generation never forces a full rescan. Template edits are detected by hashing note type templates, so add-ons that merely touch note types (e.g. AnkiHub) don't trigger rescans. A full scan also drops failed entries for text no card has any more. Stale partial `.tmp` audio files are removed on profile open. Transient Edge failures are marked failed with retry backoff, so repeated startup/sync scans do not immediately hammer the service.
 
@@ -115,7 +117,7 @@ This produces `anki_tts.ankiaddon` — install it via Anki's add-on manager.
 
 ### Prerequisites for Building
 
-Edge TTS (`edge-tts`, `aiohttp` and their dependencies) is bundled under `anki_tts_addon/vendor/`, which is not checked into git. `build_addon.sh` fills it automatically with `python3 -m pip` using wheels for Anki's embedded Python (CPython 3.13, macOS arm64 by default), and refuses to build if `edge_tts` is missing. Override the target with `ANKI_PY_VERSION` / `ANKI_PY_PLATFORM` (e.g. `ANKI_PY_PLATFORM=macosx_10_13_x86_64` for Intel Macs) and force a refresh with `REFRESH_VENDOR=1`.
+Edge TTS (`edge-tts`, `aiohttp` and their dependencies) is bundled under `anki_tts_addon/vendor/`, which is not checked into git. `build_addon.sh` fills it automatically with `python3 -m pip` using wheels for Anki's embedded Python (CPython 3.13, macOS arm64 by default), and refuses to build if `edge_tts` is missing or older than 7.3.1 (older clients are rejected by Microsoft with HTTP 403). An existing `vendor/` with an older `edge-tts` is replaced automatically; raise the floor with `EDGE_TTS_MIN_VERSION=x.y.z`. The first launch with a newer `edge-tts` retries every failed clip at once, and the log records which `edge-tts` version was loaded. Override the target with `ANKI_PY_VERSION` / `ANKI_PY_PLATFORM` (e.g. `ANKI_PY_PLATFORM=macosx_10_13_x86_64` for Intel Macs) and force a refresh with `REFRESH_VENDOR=1`.
 
 ## Project Structure
 
@@ -140,7 +142,7 @@ build_addon.sh         # Builds the .ankiaddon package
 
 ## Compatibility
 
-- Anki 2.1.x+ (tested with Anki 25.02)
+- Anki 25.07+ (Python 3.13 builds; tested with Anki 26.09.3)
 - macOS, Linux, Windows
 
 ## License

@@ -397,6 +397,20 @@ class RetryFailuresTests(unittest.TestCase):
             reloaded = AudioCacheState(path, now=Clock(100))
             self.assertEqual(reloaded.summary()["failed"], 2)
 
+    def test_retry_failures_now_since_only_resets_newer_failures(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clock = Clock(100)
+            state = AudioCacheState(Path(tmpdir) / "s.json", now=clock)
+            state.mark_failed("old", "request timed out", "hello")
+            clock.value = 110
+            state.mark_failed("new", "HTTP 403", "world")
+            clock.value = 111
+
+            self.assertEqual(state.retry_failures_now(failed_since=105), 1)
+
+            self.assertTrue(state.can_retry("new"))
+            self.assertFalse(state.can_retry("old"))
+
     def test_retry_failures_now_with_nothing_failed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state = AudioCacheState(Path(tmpdir) / "s.json", now=Clock(100))
