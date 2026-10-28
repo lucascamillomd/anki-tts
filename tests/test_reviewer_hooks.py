@@ -205,6 +205,8 @@ class ReviewerHookTests(unittest.TestCase):
         self.addCleanup(self._user_files.cleanup)
         user_files = Path(self._user_files.name)
         self.addon._addon_user_files_dir = lambda: user_files
+        # Tests must not depend on whether this checkout has a vendor/ dir.
+        self.addon.bundled_edge_tts_version = lambda: None
 
     def tearDown(self):
         _purge_addon_modules()
@@ -315,9 +317,13 @@ class ReviewerHookTests(unittest.TestCase):
                 events.append(("cleanup", min_age_seconds))
                 return 2
 
+            def total_bytes(self):
+                events.append("measure")
+                return 0
+
         class RecordingCollection(_FakeCollection):
             def find_cards(self, query):
-                events.append("warm")
+                events.append(("warm", query))
                 return super().find_cards(query)
 
         self.addon._menu_added = True
@@ -328,8 +334,9 @@ class ReviewerHookTests(unittest.TestCase):
 
         self.addon._on_profile_did_open()
 
-        # The directory scan runs off the main thread, and only removes
-        # leftovers old enough not to belong to a clip being generated now.
+        # The directory scan runs off the main thread, only removes leftovers
+        # old enough not to belong to a clip being generated now, and
+        # measures the cache so live speech never has to.
         self.assertEqual(events, [])
         self.assertEqual(
             self.hooks.background_calls[0]["kwargs"], {"uses_collection": False}
@@ -340,7 +347,12 @@ class ReviewerHookTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            [("cleanup", self.addon.TEMP_FILE_MIN_AGE_SECONDS), "warm"],
+            [
+                ("cleanup", self.addon.TEMP_FILE_MIN_AGE_SECONDS),
+                "measure",
+                ("warm", "is:due"),
+                ("warm", ""),
+            ],
         )
 
     def test_profile_open_does_not_start_prefetcher_when_tts_disabled(self):
@@ -585,7 +597,7 @@ class ReviewerHookTests(unittest.TestCase):
         self._run_all_timers()
 
         self.assertEqual(old_collection.find_queries, [])
-        self.assertEqual(new_collection.find_queries, [""])
+        self.assertEqual(new_collection.find_queries, ["is:due", ""])
         self.assertEqual(prefetcher.enqueued, [("new", _DEFAULT_CONFIG)])
 
     def test_stop_prefetcher_preserves_worker_when_timed_stop_fails(self):
@@ -862,7 +874,7 @@ class ReviewerHookTests(unittest.TestCase):
         self._run_all_timers()
 
         self.assertTrue(prefetcher.started)
-        self.assertEqual(collection.find_queries, [""])
+        self.assertEqual(collection.find_queries, ["is:due", ""])
         self.assertEqual(collection.get_card_ids, [101, 202])
         self.assertEqual(helper_card_ids, [101, 202])
         self.assertEqual(speakable_card.render_reload_values, [True])
@@ -880,6 +892,44 @@ class ReviewerHookTests(unittest.TestCase):
             self.hooks.tooltips[-1],
             "Queued 1 cards for TTS audio caching",
         )
+
+    def test_full_scan_queues_cards_due_today_first(self):
+        class DueCollection(_FakeCollection):
+            def find_cards(self, query):
+                cards = super().find_cards(query)
+                return [303] if query == "is:due" else cards
+
+        cards = [
+            _FakeDueCard(101, "first card"),
+            _FakeDueCard(202, "second card"),
+            _FakeDueCard(303, "due card"),
+        ]
+        collection = DueCollection({card.id: card for card in cards})
+        self.addon.mw.col = collection
+        prefetcher = _FakePrefetcher()
+        self.addon._engine = _FakeEngine()
+        self.addon._prefetcher = None
+        self.addon.AudioPrefetcher = lambda _engine: prefetcher
+
+        self.addon.warm_all_audio_cache()
+        self._run_all_timers()
+
+        self.assertEqual(collection.get_card_ids, [303, 101, 202])
+        self.assertEqual(
+            [text for text, _conf in prefetcher.enqueued],
+            ["due card", "first card", "second card"],
+        )
+
+    def test_prefetcher_runs_concurrent_workers(self):
+        workers = []
+        prefetcher = _FakePrefetcher()
+        prefetcher.set_workers = workers.append
+        self.addon._engine = _FakeEngine()
+        self.addon._prefetcher = None
+        self.addon.AudioPrefetcher = lambda _engine: prefetcher
+
+        self.assertIs(self.addon.prefetcher(), prefetcher)
+        self.assertEqual(workers, [self.addon.PREFETCH_WORKERS])
 
     def test_warm_all_audio_cache_respects_disabled_audio_cache_settings(self):
         for key in ("enabled", "cache_enabled", "prefetch_enabled"):
@@ -957,7 +1007,7 @@ class ReviewerHookTests(unittest.TestCase):
 
         self._run_all_timers()
 
-        self.assertEqual(collection.find_queries, [""])
+        self.assertEqual(collection.find_queries, ["is:due", ""])
         self.assertEqual(collection.get_card_ids, [1])
         self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
         self.assertEqual(
@@ -1454,7 +1504,7 @@ class ReviewerHookTests(unittest.TestCase):
 
         self._run_all_timers()
 
-        self.assertEqual(collection.find_queries, [""])
+        self.assertEqual(collection.find_queries, ["is:due", ""])
         self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
         self.assertEqual(self.hooks.tooltips, [])
 
@@ -1474,7 +1524,7 @@ class ReviewerHookTests(unittest.TestCase):
 
         self._run_all_timers()
 
-        self.assertEqual(collection.find_queries, [""])
+        self.assertEqual(collection.find_queries, ["is:due", ""])
         self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
         self.assertEqual(self.hooks.tooltips, [])
 
@@ -1684,7 +1734,7 @@ class ReviewerHookTests(unittest.TestCase):
 
             self.addon.on_sync_did_finish()
             self._run_all_timers()
-            self.assertEqual(collection.find_queries, [""])
+            self.assertEqual(collection.find_queries, ["is:due", ""])
             self._write_cached_audio(cache, "two")
 
             collection.changed_ids = [1]
@@ -1694,7 +1744,7 @@ class ReviewerHookTests(unittest.TestCase):
 
             # Incremental: changed card 1 plus the backlog of cards whose
             # audio was missing at the last scan (2 and 3), not a full scan.
-            self.assertEqual(collection.find_queries, [""])
+            self.assertEqual(collection.find_queries, ["is:due", ""])
             self.assertEqual(len(collection.db.list_queries), 1)
             self.assertEqual(collection.get_card_ids, [1, 2, 3])
 
@@ -1721,7 +1771,7 @@ class ReviewerHookTests(unittest.TestCase):
             self.addon.on_sync_did_finish()
             self._run_all_timers()
 
-            self.assertEqual(collection.find_queries, [""])
+            self.assertEqual(collection.find_queries, ["is:due", ""])
             self.assertEqual(len(collection.db.list_queries), 1)
             self.assertEqual(collection.get_card_ids, [1, 1])
 
@@ -1793,7 +1843,7 @@ class ReviewerHookTests(unittest.TestCase):
             self.addon.on_sync_did_finish()
             self._run_all_timers()
 
-            self.assertEqual(collection.find_queries, ["", ""])
+            self.assertEqual(collection.find_queries, ["is:due", "", "is:due", ""])
 
     def test_sync_will_start_cancels_scheduled_and_running_warm(self):
         collection, prefetcher = self._set_up_auto_warm(
@@ -1816,7 +1866,7 @@ class ReviewerHookTests(unittest.TestCase):
         self._run_all_timers()
 
         # The manual request deferred by the sync runs as a full, manual scan.
-        self.assertEqual(collection.find_queries, [""])
+        self.assertEqual(collection.find_queries, ["is:due", ""])
         self.assertEqual(prefetcher.enqueued, [("speakable", _DEFAULT_CONFIG)])
         self.assertEqual(
             self.hooks.tooltips[-1],
@@ -1860,7 +1910,7 @@ class ReviewerHookTests(unittest.TestCase):
         self.assertEqual(len(self.hooks.timers), 1)
         self._run_all_timers()
 
-        self.assertEqual(collection.find_queries, ["", ""])
+        self.assertEqual(collection.find_queries, ["is:due", "", "is:due", ""])
         self.assertIsNone(self.addon._warm_job)
         self.assertIsNone(self.addon._warm_rescan)
 
@@ -1926,7 +1976,7 @@ class ReviewerHookTests(unittest.TestCase):
             self.addon.warm_all_audio_cache()
             self._run_all_timers()
 
-        self.assertEqual(collection.find_queries, ["", ""])
+        self.assertEqual(collection.find_queries, ["is:due", "", "is:due", ""])
         self.assertIsNone(self.addon._warm_job)
         self.assertEqual(
             self.hooks.tooltips[-1],
@@ -1995,6 +2045,116 @@ class ReviewerHookTests(unittest.TestCase):
 
             self.assertEqual(collection.get_card_ids[:2], [1, 2])
 
+    def test_edge_tts_update_retries_failures_in_backoff_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json", now=lambda: 0)
+            state.mark_failed(self._cache_key("one"), "HTTP 403", "one")
+            self.addon._audio_cache_state = state
+            self.addon.bundled_edge_tts_version = lambda: "7.3.1"
+            _collection, prefetcher = self._set_up_auto_warm(
+                {1: _FakeDueCard(1, "one")}
+            )
+
+            self.addon.warm_all_audio_cache()
+            self._run_all_timers()
+
+            self.assertEqual(prefetcher.enqueued, [("one", _DEFAULT_CONFIG)])
+            self.assertEqual(state.get_meta("edge_tts_version"), "7.3.1")
+
+            # Same version on a later scan: backoff applies as usual.
+            state.mark_failed(self._cache_key("one"), "HTTP 403", "one")
+            prefetcher.enqueued.clear()
+            self.addon._edge_version_checked = False
+            self.addon.warm_all_audio_cache()
+            self._run_all_timers()
+
+            self.assertEqual(prefetcher.enqueued, [])
+
+    def test_edge_recovery_retries_failed_clips_at_most_once_per_interval(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json", now=lambda: 0)
+            self.addon._audio_cache_state = state
+            _collection, prefetcher = self._set_up_auto_warm(
+                {1: _FakeDueCard(1, "one")}
+            )
+            self.addon.on_sync_did_finish()
+            self._run_all_timers()
+            prefetcher.result_callback(
+                "one", _DEFAULT_CONFIG, False, "network connection failed"
+            )
+            prefetcher.enqueued.clear()
+
+            self.addon._on_edge_recovered(0, 600)
+            self.assertEqual(len(self._delayed_timers()), 1)
+            self._run_all_timers()
+
+            self.assertEqual(prefetcher.enqueued, [("one", _DEFAULT_CONFIG)])
+
+            prefetcher.result_callback(
+                "one", _DEFAULT_CONFIG, False, "network connection failed"
+            )
+            self.addon._on_edge_recovered(0, 600)
+
+            self.assertEqual(self._delayed_timers(), [])
+            self.assertIsNotNone(
+                state.entry(self._cache_key("one"))["next_retry_at"]
+            )
+
+    def test_edge_recovery_only_retries_failures_from_the_outage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            clock = [1000]
+            state = self._new_cache_state(
+                root / "state.json", now=lambda: clock[0]
+            )
+            old_key = self._cache_key("old")
+            new_key = self._cache_key("new")
+            # Failed before the outage, many times: keeps its backoff.
+            for _ in range(8):
+                state.mark_failed(old_key, "request timed out", "old")
+            clock[0] = 5000
+            state.mark_failed(new_key, "HTTP 403", "new")
+            self.addon._audio_cache_state = state
+            self._set_up_auto_warm({1: _FakeDueCard(1, "one")})
+
+            self.addon._on_edge_recovered(4000, 1000)
+
+            self.assertIsNone(state.entry(new_key)["next_retry_at"])
+            self.assertIsNotNone(state.entry(old_key)["next_retry_at"])
+
+    def test_short_edge_outage_keeps_per_clip_backoff(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.addon._audio_cache = self.addon.AudioCache(root / "cache")
+            state = self._new_cache_state(root / "state.json", now=lambda: 0)
+            key = self._cache_key("one")
+            state.mark_failed(key, "request timed out", "one")
+            self.addon._audio_cache_state = state
+            self._set_up_auto_warm({1: _FakeDueCard(1, "one")})
+
+            self.addon._on_edge_recovered(0, 120)
+
+            self.assertEqual(self._delayed_timers(), [])
+            self.assertIsNotNone(state.entry(key)["next_retry_at"])
+
+    def test_profile_open_registers_edge_recovered_callback(self):
+        self.addon._menu_added = True
+        self.addon._hooks_registered = True
+        self.addon._prefetcher = _FakePrefetcher()
+        engine_module = importlib.import_module("anki_tts_addon.tts_engine")
+        self.addCleanup(engine_module.set_recovered_callback, None)
+
+        self.addon._on_profile_did_open()
+
+        self.assertIs(
+            engine_module._recovered_callback, self.addon._on_edge_recovered
+        )
+
     def test_full_scan_prunes_failures_no_card_has_anymore(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2046,9 +2206,7 @@ class ReviewerHookTests(unittest.TestCase):
             audio_file.write_bytes(b"audio")
             second_audio_file.write_bytes(b"audio")
             non_audio_file.write_text("keep")
-            self.addon._audio_cache = types.SimpleNamespace(
-                iter_audio_files=lambda: iter([audio_file, second_audio_file])
-            )
+            self.addon._audio_cache = self.addon.AudioCache(root)
 
             self.addon.clear_audio_cache()
 
@@ -2110,7 +2268,7 @@ class ReviewerHookTests(unittest.TestCase):
         self.addon._engine = RecordingEngine()
         self.addon._prefetcher = RecordingPrefetcher()
         self.addon._audio_cache = types.SimpleNamespace(
-            iter_audio_files=lambda: iter([])
+            remove_all_audio_files=lambda: 0
         )
 
         self.addon.clear_audio_cache()
@@ -2125,9 +2283,7 @@ class ReviewerHookTests(unittest.TestCase):
             root = Path(temp_dir)
             audio_file = root / "cached.mp3"
             audio_file.write_bytes(b"audio")
-            self.addon._audio_cache = types.SimpleNamespace(
-                iter_audio_files=lambda: iter([audio_file])
-            )
+            self.addon._audio_cache = self.addon.AudioCache(root)
 
             self.addon.clear_audio_cache()
 
@@ -2153,9 +2309,7 @@ class ReviewerHookTests(unittest.TestCase):
             root = Path(temp_dir)
             audio_file = root / "cached.mp3"
             audio_file.write_bytes(b"audio")
-            self.addon._audio_cache = types.SimpleNamespace(
-                iter_audio_files=lambda: iter([audio_file])
-            )
+            self.addon._audio_cache = self.addon.AudioCache(root)
 
             self.addon.clear_audio_cache()
 

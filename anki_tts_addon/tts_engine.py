@@ -18,6 +18,7 @@ import threading
 import time
 import logging
 import platform
+import re
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -27,7 +28,24 @@ log = logging.getLogger(__name__)
 
 # Status callback — set by __init__.py to show tooltips to the user
 _status_callback: Optional[Callable[[str], None]] = None
+# Called (from an engine thread) when Edge works again after the breaker
+# tripped, so failed clips can be retried without waiting for a restart.
+# Receives the outage: its start (wall-clock seconds, the first failure of
+# the streak that tripped the breaker) and how long it lasted in seconds.
+_recovered_callback: Optional[Callable[[float, float], None]] = None
 _edge_import_error: Optional[Exception] = None
+
+# Older edge-tts sends a Sec-MS-GEC token Microsoft rejects with HTTP 403.
+# Keep in sync with EDGE_TTS_MIN_VERSION in build_addon.sh.
+EDGE_TTS_MIN_VERSION = (7, 3, 1)
+
+# Live failures worth one immediate retry: Edge hiccups, not outages.
+_TRANSIENT_HTTP_STATUSES = (429, 500, 502, 503, 504)
+_TRANSIENT_ERROR_NAMES = (
+    "ServerDisconnectedError",
+    "ClientOSError",
+    "NoAudioReceived",
+)
 
 # asyncio.TimeoutError and concurrent.futures.TimeoutError are only aliases of
 # the builtin TimeoutError from Python 3.11; Anki still ships older Pythons.
@@ -52,6 +70,11 @@ class _SpeechCancelled(Exception):
 def set_status_callback(cb: Optional[Callable[[str], None]]):
     global _status_callback
     _status_callback = cb
+
+
+def set_recovered_callback(cb: Optional[Callable[[float, float], None]]):
+    global _recovered_callback
+    _recovered_callback = cb
 
 
 def _notify(msg: str):
@@ -93,6 +116,40 @@ def _is_network_error(exc: BaseException) -> bool:
     )
 
 
+def _http_status(exc: BaseException) -> Optional[int]:
+    """HTTP status of an aiohttp response/handshake error in the chain."""
+    for e in _exception_chain(exc):
+        status = getattr(e, "status", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
+def _is_transient_edge_error(exc: BaseException) -> bool:
+    """True for failures one immediate retry may fix (not outages).
+
+    403 is excluded (edge-tts already retried it after correcting its
+    clock), and so are offline, TLS and missing-module errors.
+    """
+    if isinstance(exc, ModuleNotFoundError) or _is_tls_error(exc):
+        return False
+    status = _http_status(exc)
+    if status is not None:
+        return status in _TRANSIENT_HTTP_STATUSES
+    chain = list(_exception_chain(exc))
+    if any(
+        isinstance(e, socket.gaierror)
+        or (isinstance(e, OSError) and e.errno in _NETWORK_ERRNOS)
+        for e in chain
+    ):
+        return False
+    return any(
+        isinstance(e, _TIMEOUT_ERRORS + (ConnectionResetError,))
+        or type(e).__name__ in _TRANSIENT_ERROR_NAMES
+        for e in chain
+    )
+
+
 def _edge_error_reason(exc: Exception) -> str:
     """Return a short user-facing reason for Edge TTS failure."""
     if isinstance(exc, ModuleNotFoundError):
@@ -100,6 +157,16 @@ def _edge_error_reason(exc: Exception) -> str:
         return f"missing module: {missing}"
     if isinstance(exc, _TIMEOUT_ERRORS):
         return "request timed out"
+    # Before the generic branch: the handshake message embeds the request
+    # URL with its client token, which must not reach the log or tooltip.
+    status = _http_status(exc)
+    if status == 403:
+        return (
+            "Edge rejected the request (HTTP 403; "
+            "bundled edge-tts may be outdated)"
+        )
+    if status is not None:
+        return f"Edge service error (HTTP {status})"
 
     if _is_tls_error(exc):
         return "TLS/certificate error"
@@ -157,20 +224,46 @@ def _import_edge_tts():
     _ensure_vendor_on_path()
     try:
         import edge_tts
-        _edge_import_error = None
-        return edge_tts
     except Exception as e:
         _edge_import_error = e
         log.warning("edge_tts import failed: %s", e)
         return None
+    _edge_import_error = None
+    version = getattr(edge_tts, "__version__", "?")
+    log.info("edge_tts %s loaded", version)
+    try:
+        version_info = tuple(getattr(edge_tts, "__version_info__", ()))
+    except TypeError:
+        version_info = ()
+    if version_info and version_info < EDGE_TTS_MIN_VERSION:
+        log.warning(
+            "Bundled edge-tts %s is older than %s; Microsoft may reject it "
+            "(HTTP 403). Rebuild the add-on with REFRESH_VENDOR=1.",
+            version,
+            ".".join(str(p) for p in EDGE_TTS_MIN_VERSION),
+        )
+    return edge_tts
+
+
+def bundled_edge_tts_version() -> Optional[str]:
+    """Version of the bundled edge_tts, read from its file without importing."""
+    path = Path(_addon_dir(), "vendor", "edge_tts", "version.py")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    match = re.search(r"^__version__\s*=\s*[\"']([^\"']+)[\"']", text, re.M)
+    return match.group(1) if match else None
 
 
 class EdgeCircuitBreaker:
     """Stops hammering Edge after repeated failures, then retries later.
 
-    Trips after THRESHOLD consecutive generation failures. Live speech skips
-    Edge for LIVE_COOLDOWN_SECONDS; background prefetch pauses for an
-    escalating cooldown. After a cooldown one more failure re-trips it, and
+    Trips after THRESHOLD consecutive generation failures. Background
+    prefetch pauses for an escalating cooldown. Live speech skips Edge for
+    LIVE_COOLDOWN_SECONDS only after a timeout trip: fast failures (403,
+    offline) cost a live card under two seconds, and skipping would miss
+    Edge coming back. After a cooldown one more failure re-trips it, and
     any success closes it again.
     """
 
@@ -178,27 +271,46 @@ class EdgeCircuitBreaker:
     LIVE_COOLDOWN_SECONDS = 60
     PREFETCH_COOLDOWNS_SECONDS = (60, 300, 900)
 
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, wall_clock=time.time):
         self._clock = clock
+        self._wall_clock = wall_clock
         self._lock = threading.Lock()
         self._failures = 0
         self._trips = 0
+        # Wall-clock time of the first failure of the current streak.
+        self._streak_started_at = None
         self._tripped_at = None
         self._open_until = 0.0
         self._last_error = None
+        self._last_trip_slow = False
 
-    def record_success(self) -> None:
+    def record_success(self) -> Optional[tuple]:
+        """Reset the breaker.
+
+        Returns (outage_started_at, outage_seconds) when this closed a
+        breaker that had tripped, else None. The outage starts at the first
+        failure of the streak that tripped it (wall-clock seconds).
+        """
         with self._lock:
+            recovered = None
+            if self._trips > 0 and self._streak_started_at is not None:
+                started = self._streak_started_at
+                recovered = (started, max(0.0, self._wall_clock() - started))
             self._failures = 0
             self._trips = 0
+            self._streak_started_at = None
             self._tripped_at = None
             self._open_until = 0.0
+            self._last_trip_slow = False
+            return recovered
 
     def record_failure(self, error) -> bool:
         """Count a failure; return True when this failure trips the breaker."""
         with self._lock:
             now = self._clock()
             self._last_error = _edge_error_reason(error)
+            if self._failures == 0 and self._trips == 0:
+                self._streak_started_at = self._wall_clock()
             self._failures += 1
             threshold = 1 if self._trips else self.THRESHOLD
             if self._failures < threshold or now < self._open_until:
@@ -209,11 +321,12 @@ class EdgeCircuitBreaker:
             self._failures = 0
             self._tripped_at = now
             self._open_until = now + cooldown
+            self._last_trip_slow = isinstance(error, _TIMEOUT_ERRORS)
             return True
 
     def live_retry_in(self) -> float:
         with self._lock:
-            if self._tripped_at is None:
+            if self._tripped_at is None or not self._last_trip_slow:
                 return 0.0
             until = min(
                 self._open_until,
@@ -245,9 +358,15 @@ class TTSEngine:
     """Manages TTS with fallback: Edge TTS -> system voice."""
 
     EDGE_VOICE = "en-GB-RyanNeural"
+    # Background requests may take their time; a live card past ~10 s is one
+    # the user has usually moved on from, so it falls back sooner.
     EDGE_REQUEST_TIMEOUT_SECONDS = 30
+    EDGE_LIVE_TIMEOUT_SECONDS = 10
+    # A transient live failure is retried once if it failed this fast.
+    LIVE_RETRY_WINDOW_SECONDS = 4.0
     PROCESS_TIMEOUT_SECONDS = 120
     STOP_WAIT_SECONDS = 0.2
+    GENERATION_LOCK_POLL_SECONDS = 0.1
     EDGE_MISSING_PAUSE_SECONDS = 3600.0
     # Evict down to this fraction of the limit so a full cache is not
     # rescanned after every new clip.
@@ -267,7 +386,9 @@ class TTSEngine:
         self._cache_max_bytes = cache_max_bytes
         self._edge_tts = None
         self._edge_tts_checked = False
+        self._edge_tts_version = None
         self._breaker = EdgeCircuitBreaker()
+        self._rejected_notified = False
         self._shutdown = False
         # All Edge requests run on one long-lived asyncio loop, so in-flight
         # requests can be cancelled and no thread is created per request.
@@ -286,6 +407,8 @@ class TTSEngine:
         self._stats_lock = threading.Lock()
         self._live_hits = 0
         self._live_misses = 0
+        # Live cards Edge did not speak, by reason (this session).
+        self._live_fallbacks = {}
 
     def set_cache_max_bytes(self, cache_max_bytes: Optional[int]) -> None:
         self._cache_max_bytes = cache_max_bytes
@@ -300,6 +423,10 @@ class TTSEngine:
             if not self._edge_tts_checked:
                 self._edge_tts = _import_edge_tts()
                 self._edge_tts_checked = True
+                if self._edge_tts is not None:
+                    self._edge_tts_version = getattr(
+                        self._edge_tts, "__version__", None
+                    )
                 if self._edge_tts is None:
                     _notify_edge_unavailable(
                         _edge_import_error
@@ -320,6 +447,7 @@ class TTSEngine:
 
     def edge_status(self) -> dict:
         status = self._breaker.snapshot()
+        status["version"] = self._edge_tts_version
         missing = self._edge_missing_reason()
         if missing is not None:
             # A missing module is not a transient outage: report it as down
@@ -331,7 +459,11 @@ class TTSEngine:
 
     def live_stats(self) -> dict:
         with self._stats_lock:
-            return {"hits": self._live_hits, "misses": self._live_misses}
+            return {
+                "hits": self._live_hits,
+                "misses": self._live_misses,
+                "fallbacks": dict(self._live_fallbacks),
+            }
 
     def status_snapshot(self) -> dict:
         with self._speech_cond:
@@ -356,6 +488,12 @@ class TTSEngine:
                 self._live_hits += 1
             else:
                 self._live_misses += 1
+
+    def _count_fallback(self, reason: str) -> None:
+        with self._stats_lock:
+            self._live_fallbacks[reason] = (
+                self._live_fallbacks.get(reason, 0) + 1
+            )
 
     # -- live speech --------------------------------------------------------
 
@@ -506,6 +644,13 @@ class TTSEngine:
             # Let the worker record the real error for this card and continue.
             self._record_edge_failure(e)
             reason = _edge_error_reason(e)
+            if _http_status(e) is not None:
+                # Rejected by Microsoft (403, 429, 5xx): one line, no
+                # traceback (the reason says it all, and the raw handshake
+                # message carries the client token).
+                log.warning("Edge TTS prefetch failed: %s", reason)
+                self._local.prefetch_error = reason
+                return False
             if not _is_network_error(e):
                 log.warning("Edge TTS prefetch failed: %s", reason)
                 raise
@@ -515,7 +660,7 @@ class TTSEngine:
             self._local.prefetch_error = reason
             return False
         else:
-            self._breaker.record_success()
+            self._record_edge_success()
             self._cleanup_cache()
             return True
         finally:
@@ -584,48 +729,77 @@ class TTSEngine:
                 log.warning("Cached TTS playback failed, regenerating: %s", e)
 
         # Tier 1: Edge TTS (online, best quality), unless the breaker is open
-        # after repeated failures.
+        # after repeated timeouts.
         edge_tts = None
-        if self._breaker.live_retry_in() <= 0:
+        retry_in = self._breaker.live_retry_in()
+        if retry_in > 0:
+            log.info(
+                "Edge TTS paused (%s, %.0f s left); using system voice",
+                self._breaker.snapshot()["last_error"],
+                retry_in,
+            )
+            self._count_fallback("paused after timeouts")
+        else:
             edge_tts = self._get_edge_tts()
+            if edge_tts is None:
+                self._count_fallback("edge_tts not installed")
         if edge_tts is not None:
-            generated = None
-            uncached = None
-            try:
-                if self._audio_cache is None:
-                    uncached = self._generate_edge_uncached(
-                        text, speed, edge_tts, generation_id
+            started = time.monotonic()
+            for attempt in range(2):
+                generated = None
+                uncached = None
+                try:
+                    if self._audio_cache is None:
+                        uncached = self._generate_edge_uncached(
+                            text, speed, edge_tts, generation_id
+                        )
+                    else:
+                        generated = self._generate_edge_cached(
+                            text, speed, edge_tts, generation_id
+                        )
+                except _SpeechCancelled:
+                    raise
+                except AudioTooSmallError as e:
+                    # Content-level glitch, not Edge being down: fall back
+                    # for this card but keep using Edge for the session.
+                    self._raise_if_cancelled(generation_id)
+                    log.warning(
+                        "Edge TTS produced unusable audio, using system "
+                        "voice for this card: %s",
+                        e,
                     )
+                    self._count_fallback("audio too small")
+                    break
+                except Exception as e:
+                    self._raise_if_cancelled(generation_id)
+                    reason = _edge_error_reason(e)
+                    if (
+                        attempt == 0
+                        and time.monotonic() - started
+                        < self.LIVE_RETRY_WINDOW_SECONDS
+                        and _is_transient_edge_error(e)
+                    ):
+                        log.info("Edge TTS failed (%s); retrying once", reason)
+                        continue
+                    log.warning(
+                        "Edge TTS failed, using system voice for this card: %s",
+                        reason,
+                    )
+                    self._record_edge_failure(e)
+                    self._count_fallback(reason)
+                    break
                 else:
-                    generated = self._generate_edge_cached(
-                        text, speed, edge_tts, generation_id
-                    )
-            except _SpeechCancelled:
-                raise
-            except AudioTooSmallError as e:
-                # Content-level glitch, not Edge being down: fall back for
-                # this card but keep using Edge for the rest of the session.
-                self._raise_if_cancelled(generation_id)
-                log.warning(
-                    "Edge TTS produced unusable audio, using system "
-                    "voice for this card: %s",
-                    e,
-                )
-            except Exception as e:
-                self._raise_if_cancelled(generation_id)
-                log.warning(
-                    "Edge TTS failed, using system voice for this card: %s",
-                    _edge_error_reason(e),
-                )
-                self._record_edge_failure(e)
-            else:
-                self._breaker.record_success()
-                if generated is not None:
-                    self._cleanup_cache()
-                # Playback errors are not Edge failures and must not make
-                # the same text be spoken a second time by the fallback.
-                self._play_generated(generated, uncached, generation_id)
-                return
+                    self._record_edge_success()
+                    # Playback errors are not Edge failures and must not make
+                    # the same text be spoken a second time by the fallback.
+                    # Evict only after playing: a cleanup can stat and delete
+                    # thousands of clips, and the user is waiting to hear one.
+                    try:
+                        self._play_generated(generated, uncached, generation_id)
+                    finally:
+                        if generated is not None:
+                            self._cleanup_cache()
+                    return
 
         # Tier 2: System TTS
         if fallback:
@@ -649,6 +823,19 @@ class TTSEngine:
                 except OSError:
                     pass
 
+    def _record_edge_success(self) -> None:
+        outage = self._breaker.record_success()
+        if outage is None:
+            return
+        started_at, duration = outage
+        log.info("Edge TTS recovered after %.0f s", duration)
+        callback = _recovered_callback
+        if callback:
+            try:
+                callback(started_at, duration)
+            except Exception:
+                log.debug("TTS recovered callback failed", exc_info=True)
+
     def _record_edge_failure(self, error: Exception) -> None:
         if self._breaker.record_failure(error):
             snapshot = self._breaker.snapshot()
@@ -657,7 +844,15 @@ class TTSEngine:
                 _edge_error_reason(error),
                 snapshot["retry_in"],
             )
-            _notify_edge_unavailable(error)
+            if _http_status(error) != 403:
+                _notify_edge_unavailable(error)
+            elif not self._rejected_notified:
+                # Retrying won't fix a rejected client: say what will, once.
+                self._rejected_notified = True
+                _notify(
+                    "Edge TTS rejected by Microsoft (HTTP 403). Update the "
+                    "Anki TTS add-on — using system voice"
+                )
 
     def _cache_key(self, text: str, speed: float) -> str:
         return speech_cache_key(text, self.EDGE_VOICE, speed)
@@ -694,12 +889,14 @@ class TTSEngine:
         if self._audio_cache is None:
             return None
 
+        # Both callers checked the cache just before; re-check under the lock.
         key = self._cache_key(text, speed)
-        cached = self._audio_cache.get(key)
-        if cached is not None:
-            return cached
-
-        with self._audio_cache.generation_lock(key):
+        lock = self._audio_cache.generation_lock(key)
+        # Another thread may be generating this clip (the prefetch worker on
+        # the card on screen): live speech must stay cancellable meanwhile.
+        while not lock.acquire(timeout=self.GENERATION_LOCK_POLL_SECONDS):
+            self._raise_if_cancelled(generation_id)
+        try:
             cached = self._audio_cache.get(key)
             if cached is not None:
                 return cached
@@ -718,6 +915,8 @@ class TTSEngine:
                 except OSError:
                     pass
                 raise
+        finally:
+            lock.release()
 
     def _generate_edge_uncached(
         self,
@@ -812,7 +1011,12 @@ class TTSEngine:
         """Generate Edge TTS audio at path on the engine's asyncio loop."""
         rate_pct = int((speed - 1.0) * 100)
         rate_str = f"+{rate_pct}%" if rate_pct >= 0 else f"{rate_pct}%"
-        timeout = self.EDGE_REQUEST_TIMEOUT_SECONDS
+        is_prefetch = getattr(self._local, "prefetch", False)
+        timeout = (
+            self.EDGE_REQUEST_TIMEOUT_SECONDS
+            if is_prefetch
+            else self.EDGE_LIVE_TIMEOUT_SECONDS
+        )
         tmp_path = os.fspath(path)
 
         async def _generate():
@@ -826,7 +1030,6 @@ class TTSEngine:
                     pass
                 raise
 
-        is_prefetch = getattr(self._local, "prefetch", False)
         loop = self._ensure_loop()
         future = asyncio.run_coroutine_threadsafe(_generate(), loop)
         with self._futures_lock:

@@ -121,16 +121,24 @@ class AudioCacheState:
             next_retry_at = entry.get("next_retry_at")
             return next_retry_at is None or self._timestamp() >= next_retry_at
 
-    def retry_failures_now(self):
-        """Make every failed entry retryable immediately (resets backoff).
+    def retry_failures_now(self, failed_since=None):
+        """Make failed entries retryable immediately (resets backoff).
 
-        The cards are re-queued by the next backlog scan. Returns the count.
+        With ``failed_since`` (wall-clock seconds), only entries whose last
+        failure is at or after it are reset; older failures keep their
+        backoff. The cards are re-queued by the next backlog scan. Returns
+        the count.
         """
+        cutoff = None if failed_since is None else int(failed_since)
         with self._lock:
             count = 0
             for entry in self._entries.values():
                 if entry.get("status") != "failed":
                     continue
+                if cutoff is not None:
+                    failed_at = _as_optional_int(entry.get("updated_at"))
+                    if failed_at is None or failed_at < cutoff:
+                        continue
                 # Keep attempts: entries with attempts are what gets persisted.
                 entry["next_retry_at"] = None
                 count += 1
